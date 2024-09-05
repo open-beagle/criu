@@ -21,7 +21,7 @@ docker run -it --rm \
   -e BUILD_OS="debian11" \
   -e BUILD_ARCH="amd64" \
   registry.cn-qingdao.aliyuncs.com/wod/debian:11 \
-  bash .beagle/build11.sh
+  bash .beagle/build.sh
 
 docker pull registry.cn-qingdao.aliyuncs.com/wod/debian:12 && \
 docker run -it --rm \
@@ -32,12 +32,16 @@ docker run -it --rm \
   -e BUILD_ARCH="amd64" \
   registry.cn-qingdao.aliyuncs.com/wod/debian:12 \
   bash .beagle/build.sh
+
+ldd build/system/usr/local/sbin/criu
 ```
 
 ## install
 
 ```bash
-apt install -y ./criu-3.19-debian12-amd64.deb
+apt install -y /etc/kubernetes/downloads/criu-3.19-debian12-amd64.deb
+
+apt install -y /etc/kubernetes/downloads/criu-3.19-debian11-amd64.deb
 ```
 
 ## cache
