@@ -3,11 +3,13 @@
 #include <stdlib.h>
 #include <sys/wait.h>
 
-#include <compel/compel.h>
+#include <compel/log.h>
+#include <compel/infect-rpc.h>
+
 #include "parasite.h"
 
-#define PARASITE_CMD_INC	PARASITE_USER_CMDS
-#define PARASITE_CMD_DEC	PARASITE_USER_CMDS + 1
+#define PARASITE_CMD_INC PARASITE_USER_CMDS
+#define PARASITE_CMD_DEC PARASITE_USER_CMDS + 1
 
 static void print_vmsg(unsigned int lvl, const char *fmt, va_list parms)
 {
@@ -17,7 +19,11 @@ static void print_vmsg(unsigned int lvl, const char *fmt, va_list parms)
 
 static int do_infection(int pid)
 {
-#define err_and_ret(msg) do { fprintf(stderr, msg); return -1; } while (0)
+#define err_and_ret(msg)              \
+	do {                          \
+		fprintf(stderr, msg); \
+		return -1;            \
+	} while (0)
 
 	int state;
 	struct parasite_ctl *ctl;
@@ -88,15 +94,15 @@ static inline int chk(int fd, int val)
 	int v = 0;
 
 	if (read(fd, &v, sizeof(v)) != sizeof(v))
-		return 0;
+		return 1;
 
 	printf("%d, want %d\n", v, val);
-	return v == val;
+	return v != val;
 }
 
 int main(int argc, char **argv)
 {
-	int p_in[2], p_out[2], p_err[2], pid, i, pass = 1;
+	int p_in[2], p_out[2], p_err[2], pid, i, err = 0;
 
 	/*
 	 * Prepare IO-s and fork the victim binary
@@ -108,14 +114,22 @@ int main(int argc, char **argv)
 
 	pid = vfork();
 	if (pid == 0) {
-		close(p_in[1]);  dup2(p_in[0], 0);  close(p_in[0]);
-		close(p_out[0]); dup2(p_out[1], 1); close(p_out[1]);
-		close(p_err[0]); dup2(p_err[1], 2); close(p_err[1]);
+		close(p_in[1]);
+		dup2(p_in[0], 0);
+		close(p_in[0]);
+		close(p_out[0]);
+		dup2(p_out[1], 1);
+		close(p_out[1]);
+		close(p_err[0]);
+		dup2(p_err[1], 2);
+		close(p_err[1]);
 		execl("./victim", "victim", NULL);
 		exit(1);
 	}
 
-	close(p_in[0]); close(p_out[1]); close(p_err[1]);
+	close(p_in[0]);
+	close(p_out[1]);
+	close(p_err[1]);
 
 	/*
 	 * Tell the little guy some numbers
@@ -128,9 +142,11 @@ int main(int argc, char **argv)
 		return 1;
 
 	printf("Checking the victim alive\n");
-	pass = chk(p_out[0], 1);
-	pass = chk(p_out[0], 42);
-	if (!pass)
+	err = chk(p_out[0], 1);
+	if (err)
+		return 1;
+	err = chk(p_out[0], 42);
+	if (err)
 		return 1;
 
 	/*
@@ -162,14 +178,14 @@ int main(int argc, char **argv)
 	printf("Checking the result\n");
 
 	/* These two came from parasite */
-	pass = chk(p_out[0], 138);
-	pass = chk(p_out[0], 403);
+	err = chk(p_out[0], 138);
+	err |= chk(p_out[0], 403);
 
 	/* These two came from post-infect */
-	pass = chk(p_out[0], 1234);
-	pass = chk(p_out[0], 4096);
+	err |= chk(p_out[0], 1234);
+	err |= chk(p_out[0], 4096);
 
-	if (pass)
+	if (!err)
 		printf("All OK\n");
 	else
 		printf("Something went WRONG\n");

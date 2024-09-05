@@ -10,36 +10,29 @@
 
 #include "zdtmtst.h"
 
-const char *test_doc	= "Check that deleted unix sockets are restored correctly";
-const char *test_author	= "Tycho Andersen <tycho.andersen@canonical.com>";
+const char *test_doc = "Check that deleted unix sockets are restored correctly";
+const char *test_author = "Tycho Andersen <tycho.andersen@canonical.com>";
 
 char *dirname;
 TEST_OPTION(dirname, string, "directory name", 1);
 
-static int fill_sock_name(struct sockaddr_un *name, const char *filename)
-{
-	char *cwd;
-
-	cwd = get_current_dir_name();
-	if (strlen(filename) + strlen(cwd) + 1 >= sizeof(name->sun_path))
-		return -1;
-
-	name->sun_family = AF_LOCAL;
-	ssprintf(name->sun_path, "%s/%s", cwd, filename);
-	return 0;
-}
+#ifdef ZDTM_UNIX_SEQPACKET
+#define SOCK_TYPE SOCK_SEQPACKET
+#else
+#define SOCK_TYPE SOCK_STREAM
+#endif
 
 static int bind_and_listen(struct sockaddr_un *addr)
 {
 	int sk;
 
-	sk = socket(PF_UNIX, SOCK_STREAM, 0);
+	sk = socket(PF_UNIX, SOCK_TYPE, 0);
 	if (sk < 0) {
 		fail("socket");
 		return -1;
 	}
 
-	if (bind(sk, (struct sockaddr *) addr, sizeof(*addr))) {
+	if (bind(sk, (struct sockaddr *)addr, sizeof(*addr))) {
 		fail("bind %s", addr->sun_path);
 		close(sk);
 		return -1;
@@ -71,10 +64,8 @@ int main(int argc, char **argv)
 		goto out;
 	}
 
-	if (fill_sock_name(&addr, filename) < 0) {
-		pr_err("filename \"%s\" is too long\n", filename);
+	if (unix_fill_sock_name(&addr, filename))
 		goto out;
-	}
 
 	sk1 = bind_and_listen(&addr);
 	if (sk1 < 0)
@@ -108,7 +99,7 @@ int main(int argc, char **argv)
 	}
 
 	if (stat(addr.sun_path, &sb) != 0) {
-		fail("%s doesn't exist after restore\n", addr.sun_path);
+		fail("%s doesn't exist after restore", addr.sun_path);
 		goto out;
 	}
 

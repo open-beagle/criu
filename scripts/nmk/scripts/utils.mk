@@ -3,7 +3,7 @@ ifndef ____nmk_defined__utils
 #
 # Usage: option := $(call try-compile,language,source-to-build,cc-options,cc-defines)
 try-compile = $(shell sh -c 'echo "$(2)" |					\
-        $(CC) $(4) -x $(1) - $(3) -o /dev/null > /dev/null 2>&1 &&		\
+        $(CC) $(CFLAGS) $(LDFLAGS) $(4) -x $(1) - $(3) -o /dev/null > /dev/null 2>&1 &&		\
         echo true || echo false')
 
 #
@@ -16,7 +16,7 @@ try-asm = $(call try-compile,assembler-with-cpp,$(1),$(2),$(3))
 
 # pkg-config-check
 # Usage: ifeq ($(call pkg-config-check, library),y)
-pkg-config-check = $(shell sh -c 'pkg-config $(1) && echo y')
+pkg-config-check = $(shell sh -c '$(PKG_CONFIG) $(1) && echo y')
 
 #
 # Remove duplicates.

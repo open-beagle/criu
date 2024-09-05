@@ -7,8 +7,8 @@
 
 #include "zdtmtst.h"
 
-const char *test_doc	= "Check, that stopped tasts are restored correctly";
-const char *test_author	= "Andrew Vagin <avagin@parallels.com>";
+const char *test_doc = "Check, that stopped tasts are restored correctly";
+const char *test_author = "Andrew Vagin <avagin@parallels.com>";
 
 int main(int argc, char **argv)
 {
@@ -65,8 +65,8 @@ int main(int argc, char **argv)
 	}
 
 	if (WIFSTOPPED(status))
-		test_msg("The procces stopped\n");
-	else{
+		test_msg("The process stopped\n");
+	else {
 		fail("The process doesn't stopped");
 		goto out;
 	}

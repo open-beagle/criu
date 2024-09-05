@@ -1,29 +1,34 @@
 # here is a workaround for a bug in libnl-3:
-# 6a8d90f5fec4 "attr: Allow attribute type 0" 
+# 6a8d90f5fec4 "attr: Allow attribute type 0"
 WRAPFLAGS		+= -Wl,--wrap=nla_parse,--wrap=nlmsg_parse
 
-ARCH_DIR		:= criu/arch/$(SRCARCH)
+ARCH_DIR		:= criu/arch/$(ARCH)
 PIE_DIR			:= criu/pie
 export ARCH_DIR PIE_DIR
 
 ifeq ($(filter clean mrproper,$(MAKECMDGOALS)),)
-	COMPEL_UAPI_INCLUDES	:= $(shell $(COMPEL_BIN) includes)
-	export COMPEL_UAPI_INCLUDES
-	COMPEL_LIBS		:= $(shell $(COMPEL_BIN) --static libs)
+        CFLAGS		+= $(shell $(COMPEL_BIN) includes)
+        COMPEL_LIBS	:= $(shell $(COMPEL_BIN) --static libs)
+        CFLAGS_PIE	+= $(shell $(COMPEL_BIN) cflags)
 endif
 
 #
-# General flags.
-ccflags-y		+= -fno-strict-aliasing
-ccflags-y		+= -iquote criu/include
-ccflags-y		+= -iquote include
-ccflags-y		+= -iquote images
-ccflags-y		+= -iquote $(ARCH_DIR)/include
-ccflags-y		+= -iquote .
-ccflags-y		+= -I/usr/include/libnl3
-ccflags-y		+= $(COMPEL_UAPI_INCLUDES)
+# Configuration file paths
+CONFIG-DEFINES		+= -DSYSCONFDIR='"/etc"'
+CONFIG-DEFINES		+= -DGLOBAL_CONFIG_DIR='"/etc/criu/"'
+CONFIG-DEFINES		+= -DDEFAULT_CONFIG_FILENAME='"default.conf"'
+CONFIG-DEFINES		+= -DUSER_CONFIG_DIR='".criu/"'
 
-export ccflags-y
+#
+# General flags.
+CFLAGS			+= -fno-strict-aliasing
+CFLAGS			+= -iquote criu/include
+CFLAGS			+= -iquote include
+CFLAGS			+= -iquote images
+CFLAGS			+= -iquote $(ARCH_DIR)/include
+CFLAGS			+= -iquote .
+CFLAGS			+= $(shell $(PKG_CONFIG) --cflags libnl-3.0)
+CFLAGS			+= $(CONFIG-DEFINES)
 
 ifeq ($(GMON),1)
 	CFLAGS		+= -pg
@@ -80,8 +85,29 @@ $(obj)/%: pie
 
 $(obj)/criu: $(PROGRAM-BUILTINS)
 	$(call msg-link, $@)
-	$(Q) $(CC) $(CFLAGS) $^ $(LIBS) $(WRAPFLAGS) $(LDFLAGS) $(GMONLDOPT) -rdynamic -o $@
+	$(Q) $(CC) $(CFLAGS) $^ $(LDFLAGS) $(LIBS) $(WRAPFLAGS) $(GMONLDOPT) -rdynamic -o $@
 
+UNIT-BUILTINS		+= $(obj)/util.o
+UNIT-BUILTINS		+= $(obj)/config.o
+UNIT-BUILTINS		+= $(obj)/log.o
+UNIT-BUILTINS		+= $(obj)/string.o
+UNIT-BUILTINS		+= $(obj)/unittest/built-in.o
+
+$(obj)/unittest/Makefile: ;
+
+$(obj)/unittest/%: .FORCE
+
+$(obj)/unittest/built-in.o: .FORCE
+	$(Q) $(MAKE) $(call build-as,Makefile,criu/unittest) all
+
+$(obj)/unittest/unittest: $(UNIT-BUILTINS)
+	$(call msg-link, $@)
+	$(Q) $(CC) $(CFLAGS) $^ $(LDFLAGS) $(LIBS) $(WRAPFLAGS) -rdynamic -o $@
+
+unittest: $(obj)/unittest/unittest
+	$(Q) $(obj)/unittest/$@
+
+.PHONY: unittest
 
 #
 # Clean the most, except generated c files
@@ -92,6 +118,7 @@ subclean:
 	$(Q) $(MAKE) $(build)=$(ARCH_DIR) clean
 	$(Q) $(MAKE) $(call build-as,Makefile.library,$(PIE_DIR)) clean
 	$(Q) $(MAKE) $(call build-as,Makefile.crtools,criu) clean
+	$(Q) $(MAKE) $(call build-as,Makefile,criu/unittest) clean
 	$(Q) $(MAKE) $(build)=$(PIE_DIR) clean
 .PHONY: subclean
 cleanup-y      += $(obj)/criu
@@ -118,11 +145,14 @@ install: $(obj)/criu
 	$(Q) install -m 644 $(UAPI_HEADERS) $(DESTDIR)$(INCLUDEDIR)/criu/
 	$(Q) mkdir -p $(DESTDIR)$(LIBEXECDIR)/criu/scripts
 	$(Q) install -m 755 scripts/systemd-autofs-restart.sh $(DESTDIR)$(LIBEXECDIR)/criu/scripts
+	$(E) "  INSTALL " scripts/criu-ns
+	$(Q) install -m 755 scripts/criu-ns $(DESTDIR)$(SBINDIR)
 .PHONY: install
 
 uninstall:
 	$(E) " UNINSTALL" criu
 	$(Q) $(RM) $(addprefix $(DESTDIR)$(SBINDIR)/,criu)
+	$(Q) $(RM) $(addprefix $(DESTDIR)$(SBINDIR)/,criu-ns)
 	$(Q) $(RM) $(addprefix $(DESTDIR)$(INCLUDEDIR)/criu/,$(notdir $(UAPI_HEADERS)))
 	$(Q) $(RM) $(addprefix $(DESTDIR)$(LIBEXECDIR)/criu/scripts/,systemd-autofs-restart.sh)
 .PHONY: uninstall

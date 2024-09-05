@@ -11,9 +11,9 @@
 #include "parasite.h"
 #include "parasite-syscall.h"
 #include "images/mm.pb-c.h"
-#include <compel/compel.h>
+#include "compel/infect.h"
 
-#define NR_IOEVENTS_IN_NPAGES(npages) ((PAGE_SIZE * npages - sizeof(struct aio_ring)) / sizeof(struct io_event))
+#define NR_IOEVENTS_IN_NPAGES(npages) ((PAGE_SIZE * (npages) - sizeof(struct aio_ring)) / sizeof(struct io_event))
 
 int dump_aio_ring(MmEntry *mme, struct vma_area *vma)
 {
@@ -38,8 +38,7 @@ int dump_aio_ring(MmEntry *mme, struct vma_area *vma)
 	}
 	mme->aios[nr] = re;
 	mme->n_aios = nr + 1;
-	pr_info("Dumping AIO ring @%"PRIx64"-%"PRIx64"\n",
-		vma->e->start, vma->e->end);
+	pr_info("Dumping AIO ring @%" PRIx64 "-%" PRIx64 "\n", vma->e->start, vma->e->end);
 	return 0;
 }
 
@@ -56,7 +55,7 @@ void free_aios(MmEntry *mme)
 
 unsigned int aio_estimate_nr_reqs(unsigned int size)
 {
-	unsigned int k_max_reqs = NR_IOEVENTS_IN_NPAGES(size/PAGE_SIZE);
+	unsigned int k_max_reqs = NR_IOEVENTS_IN_NPAGES(size / PAGE_SIZE);
 
 	if (size & ~PAGE_MASK) {
 		pr_err("Ring size is not aligned\n");
@@ -82,8 +81,7 @@ unsigned int aio_estimate_nr_reqs(unsigned int size)
 
 unsigned long aio_rings_args_size(struct vm_area_list *vmas)
 {
-	return sizeof(struct parasite_check_aios_args) +
-		vmas->nr_aios * sizeof(struct parasite_aio);
+	return sizeof(struct parasite_check_aios_args) + vmas->nr_aios * sizeof(struct parasite_aio);
 }
 
 int parasite_collect_aios(struct parasite_ctl *ctl, struct vm_area_list *vmas)
@@ -111,8 +109,7 @@ int parasite_collect_aios(struct parasite_ctl *ctl, struct vm_area_list *vmas)
 		if (!vma_area_is(vma, VMA_AREA_AIORING))
 			continue;
 
-		pr_debug(" `- Ring #%ld @%"PRIx64"\n",
-				(long)(pa - &aa->ring[0]), vma->e->start);
+		pr_debug(" `- Ring #%ld @%" PRIx64 "\n", (long)(pa - &aa->ring[0]), vma->e->start);
 		pa->ctx = vma->e->start;
 		pa->size = vma->e->end - vma->e->start;
 		pa++;

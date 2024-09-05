@@ -12,10 +12,9 @@
 #include <linux/fiemap.h>
 #include "zdtmtst.h"
 
-
-#define FSIZE 0x3B600000ULL
-#define NFILES 10
-#define BUFSIZE (1<<20)
+#define FSIZE	0x3B600000ULL
+#define NFILES	10
+#define BUFSIZE (1 << 20)
 
 const char *test_doc = "C/R of ten big (951MiB) unlinked files in root dir";
 const char *test_author = "Vitaly Ostrosablin <vostrosablin@virtuozzo.com>";
@@ -30,9 +29,10 @@ void create_check_pattern(char *buf, size_t count, unsigned char seed)
 
 struct fiemap *read_fiemap(int fd)
 {
-	test_msg("Obtaining fiemap for fd %d\n", fd);
-	struct fiemap *fiemap;
+	struct fiemap *fiemap, *tmp;
 	int extents_size;
+
+	test_msg("Obtaining fiemap for fd %d\n", fd);
 
 	fiemap = malloc(sizeof(struct fiemap));
 	if (fiemap == NULL) {
@@ -48,16 +48,19 @@ struct fiemap *read_fiemap(int fd)
 
 	if (ioctl(fd, FS_IOC_FIEMAP, fiemap) < 0) {
 		pr_perror("FIEMAP ioctl failed");
+		free(fiemap);
 		return NULL;
 	}
 
 	extents_size = sizeof(struct fiemap_extent) * fiemap->fm_mapped_extents;
 
-	fiemap = realloc(fiemap,sizeof(struct fiemap) + extents_size);
-	if (fiemap == NULL) {
+	tmp = realloc(fiemap, sizeof(struct fiemap) + extents_size);
+	if (tmp == NULL) {
+		free(fiemap);
 		pr_perror("Cannot resize fiemap");
 		return NULL;
 	}
+	fiemap = tmp;
 	memset(fiemap->fm_extents, 0, extents_size);
 
 	fiemap->fm_extent_count = fiemap->fm_mapped_extents;
@@ -65,6 +68,7 @@ struct fiemap *read_fiemap(int fd)
 
 	if (ioctl(fd, FS_IOC_FIEMAP, fiemap) < 0) {
 		pr_perror("fiemap ioctl() failed");
+		free(fiemap);
 		return NULL;
 	}
 	test_msg("Debugkillme: %x\n", fiemap->fm_mapped_extents);
@@ -81,23 +85,19 @@ void check_extent_map(struct fiemap *map)
 	test_msg("Verifying extent map...\n");
 
 	for (i = 0; i < map->fm_mapped_extents; i++) {
-		test_msg("Extent %d, start %llx, length %llx\n",
-			i,
-			(long long) map->fm_extents[i].fe_logical,
-			(long long) map->fm_extents[i].fe_length);
+		test_msg("Extent %d, start %llx, length %llx\n", i, (long long)map->fm_extents[i].fe_logical,
+			 (long long)map->fm_extents[i].fe_length);
 
 		if (i == 0)
 			holesize = map->fm_extents[i].fe_logical;
 		datasize += map->fm_extents[i].fe_length;
 	}
 	if (holesize != FSIZE) {
-		pr_err("Unexpected hole size %llx != %llx\n",
-			  (long long) holesize, (unsigned long long) FSIZE);
+		pr_err("Unexpected hole size %llx != %llx\n", (long long)holesize, (unsigned long long)FSIZE);
 		exit(1);
 	}
 	if (datasize != BUFSIZE) {
-		pr_err("Unexpected data size %llx != %llx\n",
-			  (long long) datasize, (unsigned long long) BUFSIZE);
+		pr_err("Unexpected data size %llx != %llx\n", (long long)datasize, (unsigned long long)BUFSIZE);
 		exit(1);
 	}
 }
@@ -202,7 +202,7 @@ failed:
 
 int main(int argc, char **argv)
 {
-	int fd[NFILES] = {0};
+	int fd[NFILES] = { 0 };
 	char links[NFILES][PATH_MAX];
 	char link[PATH_MAX];
 	int count = 0;
@@ -212,13 +212,11 @@ int main(int argc, char **argv)
 
 	/* We need to create 10 unlinked files, each is around 1GB in size */
 	for (count = 0; count < NFILES; count++) {
-
 		test_msg("Creating unlinked file %d/%d\n", count + 1, NFILES);
 		tempfd = create_unlinked_file(count);
 
 		if (tempfd < 0) {
-			pr_err("Cannot create unlinked file %d/%d\n",
-				  count + 1, NFILES);
+			pr_err("Cannot create unlinked file %d/%d\n", count + 1, NFILES);
 			return 1;
 		}
 
@@ -243,8 +241,7 @@ int main(int argc, char **argv)
 		read_proc_fd_link(fd[count], &link[0]);
 
 		if (strcmp(&links[count][0], &link[0])) {
-			pr_err("Symlink target %s has changed to %s\n",
-				  links[count], link);
+			pr_err("Symlink target %s has changed to %s\n", links[count], link);
 			return 1;
 		}
 

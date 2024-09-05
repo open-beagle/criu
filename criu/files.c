@@ -21,7 +21,7 @@
 #include "image.h"
 #include "common/list.h"
 #include "rst-malloc.h"
-#include "util-pie.h"
+#include "util-caps.h"
 #include "common/lock.h"
 #include "sockets.h"
 #include "pstree.h"
@@ -34,6 +34,7 @@
 #include "sk-packet.h"
 #include "mount.h"
 #include "signalfd.h"
+#include "memfd.h"
 #include "namespaces.h"
 #include "tun.h"
 #include "timerfd.h"
@@ -44,6 +45,10 @@
 #include "autofs.h"
 #include "parasite.h"
 #include "parasite-syscall.h"
+#include "string.h"
+#include "kerndat.h"
+#include "fdstore.h"
+#include "bpfmap.h"
 
 #include "protobuf.h"
 #include "util.h"
@@ -52,7 +57,7 @@
 
 #include "plugin.h"
 
-#define FDESC_HASH_SIZE	64
+#define FDESC_HASH_SIZE 64
 static struct hlist_head file_desc_hash[FDESC_HASH_SIZE];
 /* file_desc's, which fle is not owned by a process, that is able to open them */
 static LIST_HEAD(fake_master_head);
@@ -73,8 +78,8 @@ void file_desc_init(struct file_desc *d, u32 id, struct file_desc_ops *ops)
 	INIT_LIST_HEAD(&d->fake_master_list);
 	INIT_HLIST_NODE(&d->hash);
 
-	d->id	= id;
-	d->ops	= ops;
+	d->id = id;
+	d->ops = ops;
 }
 
 int file_desc_add(struct file_desc *d, u32 id, struct file_desc_ops *ops)
@@ -95,8 +100,7 @@ struct file_desc *find_file_desc_raw(int type, u32 id)
 
 	chain = &file_desc_hash[id % FDESC_HASH_SIZE];
 	hlist_for_each_entry(d, chain, hash)
-		if ((d->id == id) &&
-				(d->ops->type == type || type == FD_TYPES__UND))
+		if ((d->id == id) && (d->ops->type == type || type == FD_TYPES__UND))
 			/*
 			 * Warning -- old CRIU might generate matching IDs
 			 * for different file types! So any code that uses
@@ -139,13 +143,17 @@ static void collect_task_fd(struct fdinfo_list_entry *new_fle, struct rst_info *
 {
 	struct fdinfo_list_entry *fle;
 
-	/* fles in fds list are ordered by fd */
-	list_for_each_entry(fle, &ri->fds, ps_list) {
-		if (new_fle->fe->fd < fle->fe->fd)
+	/*
+	 * fles in fds list are ordered by fd. Fds are restored from img files
+	 * in ascending order, so it is faster to insert them from the end of
+	 * the list.
+	 */
+	list_for_each_entry_reverse(fle, &ri->fds, ps_list) {
+		if (fle->fe->fd < new_fle->fe->fd)
 			break;
 	}
 
-	list_add_tail(&new_fle->ps_list, &fle->ps_list);
+	list_add(&new_fle->ps_list, &fle->ps_list);
 }
 
 unsigned int find_unused_fd(struct pstree_item *task, int hint_fd)
@@ -173,6 +181,18 @@ unsigned int find_unused_fd(struct pstree_item *task, int hint_fd)
 	BUG();
 out:
 	return fd;
+}
+
+int find_unused_fd_pid(pid_t pid)
+{
+	struct pstree_item *task;
+
+	task = pstree_item_by_virt(pid);
+	if (!task) {
+		pr_err("Invalid pid:%d\n", pid);
+		return -1;
+	}
+	return find_unused_fd(task, -1);
 }
 
 int set_fds_event(pid_t virt)
@@ -210,8 +230,7 @@ struct fdinfo_list_entry *try_file_master(struct file_desc *d)
 	if (list_empty(&d->fd_info_head))
 		return NULL;
 
-	return list_first_entry(&d->fd_info_head,
-			struct fdinfo_list_entry, desc_list);
+	return list_first_entry(&d->fd_info_head, struct fdinfo_list_entry, desc_list);
 }
 
 struct fdinfo_list_entry *file_master(struct file_desc *d)
@@ -220,8 +239,7 @@ struct fdinfo_list_entry *file_master(struct file_desc *d)
 
 	fle = try_file_master(d);
 	if (!fle) {
-		pr_err("Empty list on file desc id %#x(%d)\n", d->id,
-				d->ops ? d->ops->type : -1);
+		pr_err("Empty list on file desc id %#x(%d)\n", d->id, d->ops ? d->ops->type : -1);
 		BUG();
 	}
 
@@ -280,13 +298,12 @@ static int fixup_overlayfs(struct fd_parms *p, struct fd_link *link)
 	 * If the bug is present, the file path from /proc/<pid>/fd
 	 * does not include the mountpoint, so we prepend it ourselves.
 	 */
-	if (strcmp("./", m->mountpoint) != 0) {
+	if (strcmp("./", m->ns_mountpoint) != 0) {
 		char buf[PATH_MAX];
 		int n;
 
-		strncpy(buf, link->name, PATH_MAX);
-		buf[PATH_MAX - 1] = 0;
-		n = snprintf(link->name, PATH_MAX, "%s/%s", m->mountpoint, buf + 2);
+		__strlcpy(buf, link->name, PATH_MAX);
+		n = snprintf(link->name, PATH_MAX, "%s/%s", m->ns_mountpoint, buf + 2);
 		if (n >= PATH_MAX) {
 			pr_err("Not enough space to replace %s\n", buf);
 			return -1;
@@ -303,19 +320,21 @@ static int fixup_overlayfs(struct fd_parms *p, struct fd_link *link)
  * The kcmp-ids.c engine does this trick, see comments in it for more info.
  */
 
-static u32 make_gen_id(const struct fd_parms *p)
+uint32_t make_gen_id(uint32_t st_dev, uint32_t st_ino, uint64_t pos)
 {
-	return ((u32)p->stat.st_dev) ^ ((u32)p->stat.st_ino) ^ ((u32)p->pos);
+	uint32_t pos_hi = pos >> 32;
+	uint32_t pos_low = pos & 0xffffffff;
+
+	return st_dev ^ st_ino ^ pos_hi ^ pos_low;
 }
 
-int do_dump_gen_file(struct fd_parms *p, int lfd,
-		const struct fdtype_ops *ops, FdinfoEntry *e)
+int do_dump_gen_file(struct fd_parms *p, int lfd, const struct fdtype_ops *ops, FdinfoEntry *e)
 {
 	int ret = -1;
 
-	e->type	= ops->type;
-	e->id	= make_gen_id(p);
-	e->fd	= p->fd;
+	e->type = ops->type;
+	e->id = make_gen_id((uint32_t)p->stat.st_dev, (uint32_t)p->stat.st_ino, (uint64_t)p->pos);
+	e->fd = p->fd;
 	e->flags = p->fd_flags;
 
 	ret = fd_id_generate(p->pid, e, p);
@@ -348,8 +367,7 @@ int fill_fdlink(int lfd, const struct fd_parms *p, struct fd_link *link)
 	return 0;
 }
 
-static int fill_fd_params(struct pid *owner_pid, int fd, int lfd,
-				struct fd_opts *opts, struct fd_parms *p)
+static int fill_fd_params(struct pid *owner_pid, int fd, int lfd, struct fd_opts *opts, struct fd_parms *p)
 {
 	int ret;
 	struct statfs fsbuf;
@@ -368,20 +386,29 @@ static int fill_fd_params(struct pid *owner_pid, int fd, int lfd,
 	if (parse_fdinfo_pid(owner_pid->real, fd, FD_TYPES__UND, &fdinfo))
 		return -1;
 
-	p->fs_type	= fsbuf.f_type;
-	p->fd		= fd;
-	p->pos		= fdinfo.pos;
-	p->flags	= fdinfo.flags;
-	p->mnt_id	= fdinfo.mnt_id;
-	p->pid		= owner_pid->real;
-	p->fd_flags	= opts->flags;
+	p->fs_type = fsbuf.f_type;
+	p->fd = fd;
+	p->pos = fdinfo.pos;
+	/*
+	 * The kernel artificially adds the O_CLOEXEC flag on the file pointer
+	 * flags by looking at the flags on the file descriptor (see kernel
+	 * code fs/proc/fd.c). FD_CLOEXEC is a file descriptor property, which
+	 * is saved in fd_flags.
+	 */
+	p->flags = fdinfo.flags & ~O_CLOEXEC;
+	p->mnt_id = fdinfo.mnt_id;
+	p->pid = owner_pid->real;
+	p->fd_flags = opts->flags;
 
 	fown_entry__init(&p->fown);
 
-	pr_info("%d fdinfo %d: pos: %#16"PRIx64" flags: %16o/%#x\n",
-			owner_pid->real, fd, p->pos, p->flags, (int)p->fd_flags);
+	pr_info("%d fdinfo %d: pos: %#16" PRIx64 " flags: %16o/%#x\n", owner_pid->real, fd, p->pos, p->flags,
+		(int)p->fd_flags);
 
-	ret = fcntl(lfd, F_GETSIG, 0);
+	if (p->flags & O_PATH)
+		ret = 0;
+	else
+		ret = fcntl(lfd, F_GETSIG, 0);
 	if (ret < 0) {
 		pr_perror("Can't get owner signum on %d", lfd);
 		return -1;
@@ -391,10 +418,10 @@ static int fill_fd_params(struct pid *owner_pid, int fd, int lfd,
 	if (opts->fown.pid == 0)
 		return 0;
 
-	p->fown.pid	 = opts->fown.pid;
+	p->fown.pid = opts->fown.pid;
 	p->fown.pid_type = opts->fown.pid_type;
-	p->fown.uid	 = opts->fown.uid;
-	p->fown.euid	 = opts->fown.euid;
+	p->fown.uid = opts->fown.uid;
+	p->fown.euid = opts->fown.euid;
 
 	return 0;
 }
@@ -415,21 +442,14 @@ static const struct fdtype_ops *get_mem_dev_ops(struct fd_parms *p, int minor)
 {
 	const struct fdtype_ops *ops = NULL;
 
-	switch (minor) {
-	case 11:
-		/*
-		 * If /dev/kmsg is opened in write-only mode the file position
-		 * should not be set up upon restore, kernel doesn't allow that.
-		 */
-		if ((p->flags & O_ACCMODE) == O_WRONLY && p->pos == 0)
-			p->pos = -1ULL;
-		/*
-		 * Fallthrough.
-		 */
-	default:
-		ops = &regfile_dump_ops;
-		break;
-	};
+	/*
+	 * If /dev/kmsg is opened in write-only mode the file position
+	 * should not be set up upon restore, kernel doesn't allow that.
+	 */
+	if (minor == 11 && (p->flags & O_ACCMODE) == O_WRONLY && p->pos == 0)
+		p->pos = -1ULL;
+
+	ops = &regfile_dump_ops;
 
 	return ops;
 }
@@ -474,8 +494,8 @@ static int dump_chrdev(struct fd_parms *p, int lfd, FdinfoEntry *e)
 	return err;
 }
 
-static int dump_one_file(struct pid *pid, int fd, int lfd, struct fd_opts *opts,
-		struct parasite_ctl *ctl, FdinfoEntry *e)
+static int dump_one_file(struct pid *pid, int fd, int lfd, struct fd_opts *opts, struct parasite_ctl *ctl,
+			 FdinfoEntry *e, struct parasite_drain_fd *dfds)
 {
 	struct fd_parms p = FD_PARMS_INIT;
 	const struct fdtype_ops *ops;
@@ -498,6 +518,7 @@ static int dump_one_file(struct pid *pid, int fd, int lfd, struct fd_opts *opts,
 	}
 
 	p.fd_ctl = ctl; /* Some dump_opts require this to talk to parasite */
+	p.dfds = dfds;	/* epoll needs to verify if target fd exist */
 
 	if (S_ISSOCK(p.stat.st_mode))
 		return dump_socket(&p, lfd, e);
@@ -523,24 +544,33 @@ static int dump_one_file(struct pid *pid, int fd, int lfd, struct fd_opts *opts,
 			ops = &signalfd_dump_ops;
 		else if (is_timerfd_link(link))
 			ops = &timerfd_dump_ops;
+#ifdef CONFIG_HAS_LIBBPF
+		else if (is_bpfmap_link(link))
+			ops = &bpfmap_dump_ops;
+#endif
 		else
 			return dump_unsupp_fd(&p, lfd, "anon", link, e);
 
 		return do_dump_gen_file(&p, lfd, ops, e);
 	}
 
-	if (S_ISREG(p.stat.st_mode) || S_ISDIR(p.stat.st_mode)) {
+	if (S_ISREG(p.stat.st_mode) || S_ISDIR(p.stat.st_mode) || S_ISLNK(p.stat.st_mode)) {
 		if (fill_fdlink(lfd, &p, &link))
 			return -1;
 
 		p.link = &link;
-		if (link.name[1] == '/')
-			return do_dump_gen_file(&p, lfd, &regfile_dump_ops, e);
 
-		if (check_ns_proc(&link))
-			return do_dump_gen_file(&p, lfd, &nsfile_dump_ops, e);
+		/* TODO: Dump for hugetlb fd when memfd hugetlb is not supported */
+		if (is_memfd(p.stat.st_dev) || (kdat.has_memfd_hugetlb && is_hugetlb_dev(p.stat.st_dev, NULL)))
+			ops = &memfd_dump_ops;
+		else if (link.name[1] == '/')
+			ops = &regfile_dump_ops;
+		else if (check_ns_proc(&link))
+			ops = &nsfile_dump_ops;
+		else
+			return dump_unsupp_fd(&p, lfd, "reg", link.name + 1, e);
 
-		return dump_unsupp_fd(&p, lfd, "reg", link.name + 1, e);
+		return do_dump_gen_file(&p, lfd, ops, e);
 	}
 
 	if (S_ISFIFO(p.stat.st_mode)) {
@@ -566,13 +596,13 @@ static int dump_one_file(struct pid *pid, int fd, int lfd, struct fd_opts *opts,
 int dump_my_file(int lfd, u32 *id, int *type)
 {
 	struct pid me = {};
-	struct fd_opts fo = {};
+	struct fd_opts fdo = {};
 	FdinfoEntry e = FDINFO_ENTRY__INIT;
 
 	me.real = getpid();
 	me.ns[0].virt = -1; /* FIXME */
 
-	if (dump_one_file(&me, lfd, lfd, &fo, NULL, &e))
+	if (dump_one_file(&me, lfd, lfd, &fdo, NULL, &e, NULL))
 		return -1;
 
 	*id = e.id;
@@ -580,14 +610,13 @@ int dump_my_file(int lfd, u32 *id, int *type)
 	return 0;
 }
 
-int dump_task_files_seized(struct parasite_ctl *ctl, struct pstree_item *item,
-		struct parasite_drain_fd *dfds)
+int dump_task_files_seized(struct parasite_ctl *ctl, struct pstree_item *item, struct parasite_drain_fd *dfds)
 {
 	int *lfds = NULL;
 	struct cr_img *img = NULL;
 	struct fd_opts *opts = NULL;
 	int i, ret = -1;
-	int off, nr_fds = min((int) PARASITE_MAX_FDS, dfds->nr_fds);
+	int off, nr_fds = min((int)PARASITE_MAX_FDS, dfds->nr_fds);
 
 	pr_info("\n");
 	pr_info("Dumping opened files (pid: %d)\n", item->pid->real);
@@ -610,16 +639,14 @@ int dump_task_files_seized(struct parasite_ctl *ctl, struct pstree_item *item,
 		if (nr_fds + off > dfds->nr_fds)
 			nr_fds = dfds->nr_fds - off;
 
-		ret = parasite_drain_fds_seized(ctl, dfds, nr_fds,
-							off, lfds, opts);
+		ret = parasite_drain_fds_seized(ctl, dfds, nr_fds, off, lfds, opts);
 		if (ret)
 			goto err;
 
 		for (i = 0; i < nr_fds; i++) {
 			FdinfoEntry e = FDINFO_ENTRY__INIT;
 
-			ret = dump_one_file(item->pid, dfds->fds[i + off],
-						lfds[i], opts + i, ctl, &e);
+			ret = dump_one_file(item->pid, dfds->fds[i + off], lfds[i], opts + i, ctl, &e, dfds);
 			if (ret)
 				break;
 
@@ -778,14 +805,13 @@ static void __collect_desc_fle(struct fdinfo_list_entry *new_le, struct file_des
 {
 	struct fdinfo_list_entry *le;
 
-	list_for_each_entry(le, &fdesc->fd_info_head, desc_list)
-		if (pid_rst_prio(new_le->pid, le->pid))
+	list_for_each_entry_reverse(le, &fdesc->fd_info_head, desc_list)
+		if (pid_rst_prio_eq(le->pid, new_le->pid))
 			break;
-	list_add_tail(&new_le->desc_list, &le->desc_list);
+	list_add(&new_le->desc_list, &le->desc_list);
 }
 
-static void collect_desc_fle(struct fdinfo_list_entry *new_le,
-			     struct file_desc *fdesc, bool force_master)
+static void collect_desc_fle(struct fdinfo_list_entry *new_le, struct file_desc *fdesc, bool force_master)
 {
 	new_le->desc = fdesc;
 
@@ -797,9 +823,8 @@ static void collect_desc_fle(struct fdinfo_list_entry *new_le,
 	}
 }
 
-struct fdinfo_list_entry *collect_fd_to(int pid, FdinfoEntry *e,
-		struct rst_info *rst_info, struct file_desc *fdesc,
-		bool fake, bool force_master)
+struct fdinfo_list_entry *collect_fd_to(int pid, FdinfoEntry *e, struct rst_info *rst_info, struct file_desc *fdesc,
+					bool fake, bool force_master)
 {
 	struct fdinfo_list_entry *new_le;
 
@@ -817,8 +842,7 @@ int collect_fd(int pid, FdinfoEntry *e, struct rst_info *rst_info, bool fake)
 {
 	struct file_desc *fdesc;
 
-	pr_info("Collect fdinfo pid=%d fd=%d id=%#x\n",
-		pid, e->fd, e->id);
+	pr_info("Collect fdinfo pid=%d fd=%d id=%#x\n", pid, e->fd, e->id);
 
 	fdesc = find_file_desc(e);
 	if (fdesc == NULL) {
@@ -842,15 +866,14 @@ FdinfoEntry *dup_fdinfo(FdinfoEntry *old, int fd, unsigned flags)
 
 	fdinfo_entry__init(e);
 
-	e->id		= old->id;
-	e->type		= old->type;
-	e->fd		= fd;
-	e->flags	= flags;
+	e->id = old->id;
+	e->type = old->type;
+	e->fd = fd;
+	e->flags = flags;
 	return e;
 }
 
-int dup_fle(struct pstree_item *task, struct fdinfo_list_entry *ple,
-		   int fd, unsigned flags)
+int dup_fle(struct pstree_item *task, struct fdinfo_list_entry *ple, int fd, unsigned flags)
 {
 	FdinfoEntry *e;
 
@@ -887,7 +910,7 @@ int prepare_fd_pid(struct pstree_item *item)
 		if (ret <= 0)
 			break;
 
-		if (e->fd >= service_fd_min_fd(item)) {
+		if (e->fd >= kdat.sysctl_nr_open) {
 			ret = -1;
 			pr_err("Too big FD number to restore %d\n", e->fd);
 			break;
@@ -926,7 +949,8 @@ int set_fd_flags(int fd, int flags)
 
 	if (ret != flags) {
 		pr_err("fcntl call on fd %d (flags %#o) succeeded, "
-			"but some flags were dropped: %#o\n", fd, flags, ret);
+		       "but some flags were dropped: %#o\n",
+		       fd, flags, ret);
 		return -1;
 	}
 	return 0;
@@ -946,7 +970,7 @@ static int receive_fd(struct fdinfo_list_entry *fle);
 static void transport_name_gen(struct sockaddr_un *addr, int *len, int pid)
 {
 	addr->sun_family = AF_UNIX;
-	snprintf(addr->sun_path, UNIX_PATH_MAX, "x/crtools-fd-%d", pid);
+	snprintf(addr->sun_path, UNIX_PATH_MAX, "x/crtools-fd-%d-%" PRIx64, pid, criu_run_id);
 	*len = SUN_LEN(addr);
 	*addr->sun_path = '\0';
 }
@@ -1037,10 +1061,6 @@ static int send_fd_to_self(int fd, struct fdinfo_list_entry *fle)
 	if (fd == dfd)
 		return 0;
 
-	/* make sure we won't clash with an inherit fd */
-	if (inherit_fd_resolve_clash(dfd) < 0)
-		return -1;
-
 	BUG_ON(dfd == get_service_fd(TRANSPORT_FD_OFF));
 
 	pr_info("\t\t\tGoing to dup %d into %d\n", fd, dfd);
@@ -1107,12 +1127,12 @@ int setup_and_serve_out(struct fdinfo_list_entry *fle, int new_fd)
 static int open_fd(struct fdinfo_list_entry *fle)
 {
 	struct file_desc *d = fle->desc;
-	struct fdinfo_list_entry *flem;
+	struct fdinfo_list_entry *fle_m;
 	int new_fd = -1, ret;
 
-	flem = file_master(d);
-	if (fle != flem) {
-		BUG_ON (fle->stage != FLE_INITIALIZED);
+	fle_m = file_master(d);
+	if (fle != fle_m) {
+		BUG_ON(fle->stage != FLE_INITIALIZED);
 		ret = receive_fd(fle);
 		if (ret != 0)
 			return ret;
@@ -1190,8 +1210,7 @@ static int open_fdinfos(struct pstree_item *me)
 			BUG_ON(st == FLE_RESTORED);
 			ret = open_fd(fle);
 			if (ret == -1) {
-				pr_err("Unable to open fd=%d id=%#x\n",
-					fle->fe->fd, fle->fe->id);
+				pr_err("Unable to open fd=%d id=%#x\n", fle->fe->fd, fle->fe->id);
 				goto splice;
 			}
 			if (st != fle->stage || ret == 0)
@@ -1209,7 +1228,7 @@ static int open_fdinfos(struct pstree_item *me)
 					list_add(&fle->ps_list, &fake);
 			}
 			if (ret == 1)
-			       again = true;
+				again = true;
 		}
 		if (!progress && again)
 			wait_fds_event();
@@ -1228,13 +1247,19 @@ splice:
 	return ret;
 }
 
-static struct inherit_fd *inherit_fd_lookup_fd(int fd, const char *caller);
-
 int close_old_fds(void)
 {
 	DIR *dir;
 	struct dirent *de;
 	int fd, ret;
+
+	/**
+	 * Close previous /proc/self/ service fd, as we don't want to reuse it
+	 * from a different task. Also there can be some junk fd in it's place
+	 * after we've moved our service fds (e.g. from other task of parents
+	 * shared fdtable), we need to close it before opendir_proc() below.
+	 */
+	__close_service_fd(PROC_SELF_FD_OFF);
 
 	dir = opendir_proc(PROC_SELF, "fd");
 	if (dir == NULL)
@@ -1247,11 +1272,12 @@ int close_old_fds(void)
 		ret = sscanf(de->d_name, "%d", &fd);
 		if (ret != 1) {
 			pr_err("Can't parse %s\n", de->d_name);
+			closedir(dir);
+			close_pid_proc();
 			return -1;
 		}
 
-		if ((!is_any_service_fd(fd)) && (dirfd(dir) != fd) &&
-		    !inherit_fd_lookup_fd(fd, __FUNCTION__))
+		if ((!is_any_service_fd(fd)) && (dirfd(dir) != fd))
 			close_safe(&fd);
 	}
 
@@ -1276,7 +1302,6 @@ int prepare_fds(struct pstree_item *me)
 	sfds_protected = false;
 	close_service_fd(CGROUP_YARD);
 	sfds_protected = true;
-	set_proc_self_fd(-1); /* flush any proc cached fds we may have */
 
 	if (rsti(me)->fdt) {
 		struct fdt *fdt = rsti(me)->fdt;
@@ -1321,10 +1346,35 @@ static int fchroot(int fd)
 	return chroot(".");
 }
 
+static int need_chroot(int saved_root)
+{
+	struct stat saved_root_stat, cur_root_stat;
+	int psd;
+
+	if (fstat(saved_root, &saved_root_stat) == -1) {
+		pr_perror("Failed to stat saved root dir");
+		return -1;
+	}
+
+	psd = open_pid_proc(PROC_SELF);
+	if (psd < 0) {
+		pr_perror("Failed to open PROC_SELF");
+		return -1;
+	}
+
+	if (fstatat(psd, "root", &cur_root_stat, 0) == -1) {
+		pr_perror("Failed to stat current root dir");
+		return -1;
+	}
+
+	return saved_root_stat.st_ino != cur_root_stat.st_ino || saved_root_stat.st_dev != cur_root_stat.st_dev;
+}
+
 int restore_fs(struct pstree_item *me)
 {
 	int dd_root = -1, dd_cwd = -1, ret, err = -1;
 	struct rst_info *ri = rsti(me);
+	bool do_chroot = true;
 
 	/*
 	 * First -- open both descriptors. We will not
@@ -1344,14 +1394,23 @@ int restore_fs(struct pstree_item *me)
 	}
 
 	/*
+	 * In unprivileged mode chroot() may fail if we don't have
+	 * sufficient privileges, therefore only do it if the process
+	 * is actually chrooted.
+	 */
+	if (opts.unprivileged)
+		do_chroot = need_chroot(dd_root);
+
+	/*
 	 * Now do chroot/chdir. Chroot goes first as it calls chdir into
 	 * dd_root so we'd need to fix chdir after it anyway.
 	 */
-
-	ret = fchroot(dd_root);
-	if (ret < 0) {
-		pr_perror("Can't change root");
-		goto out;
+	if (do_chroot) {
+		ret = fchroot(dd_root);
+		if (ret < 0) {
+			pr_perror("Can't change root");
+			goto out;
+		}
 	}
 
 	ret = fchdir(dd_cwd);
@@ -1473,55 +1532,13 @@ int shared_fdt_prepare(struct pstree_item *item)
 
 struct inherit_fd {
 	struct list_head inh_list;
-	char *inh_id;		/* file identifier */
-	int inh_fd;		/* criu's descriptor to inherit */
-	dev_t inh_dev;
-	ino_t inh_ino;
-	mode_t inh_mode;
-	dev_t inh_rdev;
+	char *inh_id; /* file identifier */
+	int inh_fd;   /* criu's descriptor to inherit */
+	int inh_fd_id;
 };
 
 int inh_fd_max = -1;
 
-/*
- * Return 1 if inherit fd has been closed or reused, 0 otherwise.
- *
- * Some parts of the file restore engine can close an inherit fd
- * explicitly by close() or implicitly by dup2() to reuse that descriptor.
- * In some specific functions (for example, send_fd_to_self()), we
- * check for clashes at the beginning of the function and, therefore,
- * these specific functions will not reuse an inherit fd.  However, to
- * avoid adding a ton of clash detect and resolve code everywhere we close()
- * and/or dup2(), we just make sure that when we're dup()ing or close()ing
- * our inherit fd we're still dealing with the same fd that we inherited.
- */
-static int inherit_fd_reused(struct inherit_fd *inh)
-{
-	struct stat sbuf;
-
-	if (fstat(inh->inh_fd, &sbuf) == -1) {
-		if (errno == EBADF) {
-			pr_debug("Inherit fd %s -> %d has been closed\n",
-				inh->inh_id, inh->inh_fd);
-			return 1;
-		}
-		pr_perror("Can't fstat inherit fd %d", inh->inh_fd);
-		return -1;
-	}
-
-	if (inh->inh_dev != sbuf.st_dev || inh->inh_ino != sbuf.st_ino ||
-	    inh->inh_mode != sbuf.st_mode || inh->inh_rdev != sbuf.st_rdev) {
-		pr_info("Inherit fd %s -> %d has been reused\n",
-			inh->inh_id, inh->inh_fd);
-		return 1;
-	}
-	return 0;
-}
-
-/*
- * We can't print diagnostics messages in this function because the
- * log file isn't initialized yet.
- */
 int inherit_fd_parse(char *optarg)
 {
 	char *cp = NULL;
@@ -1555,8 +1572,7 @@ int inherit_fd_parse(char *optarg)
 	if (dbg) {
 		n = strlen(cp);
 		if (write(fd, cp, n) != n) {
-			pr_err("Can't write debug message %s to inherit fd %d\n",
-				cp, fd);
+			pr_err("Can't write debug message %s to inherit fd %d\n", cp, fd);
 			return -1;
 		}
 		return 0;
@@ -1582,12 +1598,13 @@ int inherit_fd_add(int fd, char *key)
 	if (fd > inh_fd_max)
 		inh_fd_max = fd;
 
-	inh->inh_id = key;
+	inh->inh_id = xstrdup(key);
+	if (inh->inh_id == NULL) {
+		xfree(inh);
+		return -1;
+	}
+
 	inh->inh_fd = fd;
-	inh->inh_dev = sbuf.st_dev;
-	inh->inh_ino = sbuf.st_ino;
-	inh->inh_mode = sbuf.st_mode;
-	inh->inh_rdev = sbuf.st_rdev;
 	list_add_tail(&inh->inh_list, &opts.inherit_fds);
 	return 0;
 }
@@ -1601,9 +1618,22 @@ void inherit_fd_log(void)
 	struct inherit_fd *inh;
 
 	list_for_each_entry(inh, &opts.inherit_fds, inh_list) {
-		pr_info("File %s will be restored from inherit fd %d\n",
-			inh->inh_id, inh->inh_fd);
+		pr_info("File %s will be restored from inherit fd %d\n", inh->inh_id, inh->inh_fd);
 	}
+}
+
+int inherit_fd_move_to_fdstore(void)
+{
+	struct inherit_fd *inh;
+
+	list_for_each_entry(inh, &opts.inherit_fds, inh_list) {
+		inh->inh_fd_id = fdstore_add(inh->inh_fd);
+		if (inh->inh_fd_id < 0)
+			return -1;
+		close_safe(&inh->inh_fd);
+	}
+
+	return 0;
 }
 
 /*
@@ -1617,11 +1647,8 @@ int inherit_fd_lookup_id(char *id)
 	ret = -1;
 	list_for_each_entry(inh, &opts.inherit_fds, inh_list) {
 		if (!strcmp(inh->inh_id, id)) {
-			if (!inherit_fd_reused(inh)) {
-				ret = inh->inh_fd;
-				pr_debug("Found id %s (fd %d) in inherit fd list\n",
-					id, ret);
-			}
+			ret = fdstore_get(inh->inh_fd_id);
+			pr_debug("Found id %s (fd %d) in inherit fd list\n", id, ret);
 			break;
 		}
 	}
@@ -1630,7 +1657,7 @@ int inherit_fd_lookup_id(char *id)
 
 bool inherited_fd(struct file_desc *d, int *fd_p)
 {
-	char buf[32], *id_str;
+	char buf[PATH_MAX], *id_str;
 	int i_fd;
 
 	if (!d->ops->name)
@@ -1644,94 +1671,11 @@ bool inherited_fd(struct file_desc *d, int *fd_p)
 	if (fd_p == NULL)
 		return true;
 
-	*fd_p = dup(i_fd);
-	if (*fd_p < 0)
-		pr_perror("Inherit fd DUP failed");
-	else
-		pr_info("File %s will be restored from fd %d dumped "
-				"from inherit fd %d\n", id_str, *fd_p, i_fd);
+	*fd_p = i_fd;
+	pr_info("File %s will be restored from fd %d dumped "
+		"from inherit fd %d\n",
+		id_str, *fd_p, i_fd);
 	return true;
-}
-
-/*
- * Look up the inherit fd list by a file descriptor.
- */
-static struct inherit_fd *inherit_fd_lookup_fd(int fd, const char *caller)
-{
-	struct inherit_fd *ret;
-	struct inherit_fd *inh;
-
-	ret = NULL;
-	list_for_each_entry(inh, &opts.inherit_fds, inh_list) {
-		if (inh->inh_fd == fd) {
-			if (!inherit_fd_reused(inh)) {
-				ret = inh;
-				pr_debug("Found fd %d (id %s) in inherit fd list (caller %s)\n",
-					fd, inh->inh_id, caller);
-			}
-			break;
-		}
-	}
-	return ret;
-}
-
-/*
- * If the specified fd clashes with an inherit fd,
- * move the inherit fd.
- */
-int inherit_fd_resolve_clash(int fd)
-{
-	int newfd;
-	struct inherit_fd *inh;
-
-	inh = inherit_fd_lookup_fd(fd, __FUNCTION__);
-	if (inh == NULL)
-		return 0;
-
-	newfd = dup(fd);
-	if (newfd == -1) {
-		pr_perror("Can't dup inherit fd %d", fd);
-		return -1;
-	}
-
-	if (close(fd) == -1) {
-		close(newfd);
-		pr_perror("Can't close inherit fd %d", fd);
-		return -1;
-	}
-
-	inh->inh_fd = newfd;
-	pr_debug("Inherit fd %d moved to %d to resolve clash\n", fd, inh->inh_fd);
-	return 0;
-}
-
-/*
- * Close all inherit fds.
- */
-int inherit_fd_fini()
-{
-	int reused;
-	struct inherit_fd *inh;
-
-	list_for_each_entry(inh, &opts.inherit_fds, inh_list) {
-		if (inh->inh_fd < 0) {
-			pr_err("File %s in inherit fd list has invalid fd %d\n",
-				inh->inh_id, inh->inh_fd);
-			return -1;
-		}
-
-		reused = inherit_fd_reused(inh);
-		if (reused < 0)
-			return -1;
-
-		if (!reused) {
-			pr_debug("Closing inherit fd %d -> %s\n", inh->inh_fd,
-				inh->inh_id);
-			if (close_safe(&inh->inh_fd) < 0)
-				return -1;
-		}
-	}
-	return 0;
 }
 
 int open_transport_socket(void)
@@ -1753,18 +1697,14 @@ int open_transport_socket(void)
 		goto out;
 	}
 
-	if (install_service_fd(TRANSPORT_FD_OFF, sock) < 0) {
-		close(sock);
+	if (install_service_fd(TRANSPORT_FD_OFF, sock) < 0)
 		goto out;
-	}
-	close(sock);
 	ret = 0;
 out:
 	return ret;
 }
 
-static int collect_one_file_entry(FileEntry *fe, u_int32_t id, ProtobufCMessage *base,
-		struct collect_image_info *cinfo)
+static int collect_one_file_entry(FileEntry *fe, u_int32_t id, ProtobufCMessage *base, struct collect_image_info *cinfo)
 {
 	if (fe->id != id) {
 		pr_err("ID mismatch %u != %u\n", fe->id, id);
@@ -1835,6 +1775,14 @@ static int collect_one_file(void *o, ProtobufCMessage *base, struct cr_img *i)
 	case FD_TYPES__TTY:
 		ret = collect_one_file_entry(fe, fe->tty->id, &fe->tty->base, &tty_cinfo);
 		break;
+	case FD_TYPES__MEMFD:
+		ret = collect_one_file_entry(fe, fe->memfd->id, &fe->memfd->base, &memfd_cinfo);
+		break;
+#ifdef CONFIG_HAS_LIBBPF
+	case FD_TYPES__BPFMAP:
+		ret = collect_one_file_entry(fe, fe->bpf->id, &fe->bpf->base, &bpfmap_cinfo);
+		break;
+#endif
 	}
 
 	return ret;
@@ -1851,5 +1799,6 @@ struct collect_image_info files_cinfo = {
 int prepare_files(void)
 {
 	init_fdesc_hash();
+	init_sk_info_hash();
 	return collect_image(&files_cinfo);
 }

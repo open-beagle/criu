@@ -11,13 +11,13 @@
 
 #include "zdtmtst.h"
 
-const char *test_doc	= "Check that mounts with external master peers are c/r'd";
-const char *test_author	= "Tycho Andersen <tycho.andersen@canonical.com>";
+const char *test_doc = "Check that mounts with external master peers are c/r'd";
+const char *test_author = "Tycho Andersen <tycho.andersen@canonical.com>";
 
 char *dirname = "mnt_ext_auto.test";
 TEST_OPTION(dirname, string, "directory name", 1);
 
-int main(int argc, char ** argv)
+int main(int argc, char **argv)
 {
 	char src[PATH_MAX], dst[PATH_MAX], *root;
 	char *dname = "/tmp/zdtm_ext_auto.XXXXXX";
@@ -39,11 +39,18 @@ int main(int argc, char ** argv)
 		pr_perror("mount");
 		return 1;
 	}
+	if (mount(NULL, dname, NULL, MS_SHARED, NULL)) {
+		pr_perror("shared");
+		return 1;
+	}
 
 	mkdir(src, 755);
 	mkdir(dst, 755);
 
-	unshare(CLONE_NEWNS);
+	if (unshare(CLONE_NEWNS)) {
+		pr_perror("unshare");
+		return 1;
+	}
 
 	if (mount(src, dst, NULL, MS_BIND, NULL)) {
 		pr_perror("bind");
@@ -60,7 +67,6 @@ test:
 
 	test_daemon();
 	test_waitsig();
-
 
 	pass();
 

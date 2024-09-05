@@ -136,3 +136,69 @@ ENTRY(main)
         nop
 END(main)
 endef
+
+define FEATURE_TEST_NFTABLES_LIB_API_0
+
+#include <string.h>
+
+#include <nftables/libnftables.h>
+
+int main(int argc, char **argv)
+{
+	return nft_run_cmd_from_buffer(nft_ctx_new(NFT_CTX_DEFAULT), \"cmd\", strlen(\"cmd\"));
+}
+
+endef
+
+define FEATURE_TEST_NFTABLES_LIB_API_1
+
+#include <nftables/libnftables.h>
+
+int main(int argc, char **argv)
+{
+	return nft_run_cmd_from_buffer(nft_ctx_new(NFT_CTX_DEFAULT), \"cmd\");
+}
+
+endef
+
+define FEATURE_TEST_MEMFD_CREATE
+
+#include <sys/mman.h>
+#include <stddef.h>
+
+int main(void)
+{
+	return memfd_create(NULL, 0);
+}
+endef
+
+define FEATURE_TEST_OPENAT2
+
+#include <linux/openat2.h>
+
+int main(void)
+{
+	if (RESOLVE_NO_XDEV > 0)
+		return 0;
+	return 0;
+}
+endef
+
+define FEATURE_TEST_NO_LIBC_RSEQ_DEFS
+
+#ifdef __has_include
+#if __has_include(\"sys/rseq.h\")
+#include <sys/rseq.h>
+#endif
+#endif
+
+enum rseq_cpu_id_state {
+	RSEQ_CPU_ID_UNINITIALIZED = -1,
+	RSEQ_CPU_ID_REGISTRATION_FAILED = -2,
+};
+
+int main(void)
+{
+	return 0;
+}
+endef

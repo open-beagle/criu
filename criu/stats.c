@@ -17,13 +17,13 @@ struct timing {
 };
 
 struct dump_stats {
-	struct timing	timings[DUMP_TIME_NR_STATS];
-	unsigned long	counts[DUMP_CNT_NR_STATS];
+	struct timing timings[DUMP_TIME_NR_STATS];
+	unsigned long counts[DUMP_CNT_NR_STATS];
 };
 
 struct restore_stats {
-	struct timing	timings[RESTORE_TIME_NS_STATS];
-	atomic_t	counts[RESTORE_CNT_NR_STATS];
+	struct timing timings[RESTORE_TIME_NS_STATS];
+	atomic_t counts[RESTORE_CNT_NR_STATS];
 };
 
 struct dump_stats *dstats;
@@ -41,8 +41,19 @@ void cnt_add(int c, unsigned long val)
 		BUG();
 }
 
-static void timeval_accumulate(const struct timeval *from, const struct timeval *to,
-		struct timeval *res)
+void cnt_sub(int c, unsigned long val)
+{
+	if (dstats != NULL) {
+		BUG_ON(c >= DUMP_CNT_NR_STATS);
+		dstats->counts[c] -= val;
+	} else if (rstats != NULL) {
+		BUG_ON(c >= RESTORE_CNT_NR_STATS);
+		atomic_add(-val, &rstats->counts[c]);
+	} else
+		BUG();
+}
+
+static void timeval_accumulate(const struct timeval *from, const struct timeval *to, struct timeval *res)
 {
 	suseconds_t usec;
 
@@ -90,6 +101,10 @@ void timing_stop(int t)
 	struct timing *tm;
 	struct timeval now;
 
+	/* stats haven't been initialized. */
+	if (!dstats && !rstats)
+		return;
+
 	tm = get_timing(t);
 	gettimeofday(&now, NULL);
 	timeval_accumulate(&tm->start, &now, &tm->total);
@@ -114,23 +129,22 @@ static void display_stats(int what, StatsEntry *stats)
 		if (stats->dump->has_irmap_resolve)
 			pr_msg("IRMAP resolve time: %d us\n", stats->dump->irmap_resolve);
 		pr_msg("Memory pages scanned: %" PRIu64 " (0x%" PRIx64 ")\n", stats->dump->pages_scanned,
-				stats->dump->pages_scanned);
+		       stats->dump->pages_scanned);
 		pr_msg("Memory pages skipped from parent: %" PRIu64 " (0x%" PRIx64 ")\n",
-				stats->dump->pages_skipped_parent,
-				stats->dump->pages_skipped_parent);
+		       stats->dump->pages_skipped_parent, stats->dump->pages_skipped_parent);
 		pr_msg("Memory pages written: %" PRIu64 " (0x%" PRIx64 ")\n", stats->dump->pages_written,
-				stats->dump->pages_written);
+		       stats->dump->pages_written);
 		pr_msg("Lazy memory pages: %" PRIu64 " (0x%" PRIx64 ")\n", stats->dump->pages_lazy,
-				stats->dump->pages_lazy);
+		       stats->dump->pages_lazy);
 	} else if (what == RESTORE_STATS) {
 		pr_msg("Displaying restore stats:\n");
 		pr_msg("Pages compared: %" PRIu64 " (0x%" PRIx64 ")\n", stats->restore->pages_compared,
-				stats->restore->pages_compared);
+		       stats->restore->pages_compared);
 		pr_msg("Pages skipped COW: %" PRIu64 " (0x%" PRIx64 ")\n", stats->restore->pages_skipped_cow,
-				stats->restore->pages_skipped_cow);
+		       stats->restore->pages_skipped_cow);
 		if (stats->restore->has_pages_restored)
 			pr_msg("Pages restored: %" PRIu64 " (0x%" PRIx64 ")\n", stats->restore->pages_restored,
-					stats->restore->pages_restored);
+			       stats->restore->pages_restored);
 		pr_msg("Restore time: %d us\n", stats->restore->restore_time);
 		pr_msg("Forking time: %d us\n", stats->restore->forking_time);
 	} else
@@ -165,6 +179,13 @@ void write_stats(int what)
 		ds_entry.page_pipe_bufs = dstats->counts[CNT_PAGE_PIPE_BUFS];
 		ds_entry.has_page_pipe_bufs = true;
 
+		ds_entry.shpages_scanned = dstats->counts[CNT_SHPAGES_SCANNED];
+		ds_entry.has_shpages_scanned = true;
+		ds_entry.shpages_skipped_parent = dstats->counts[CNT_SHPAGES_SKIPPED_PARENT];
+		ds_entry.has_shpages_skipped_parent = true;
+		ds_entry.shpages_written = dstats->counts[CNT_SHPAGES_WRITTEN];
+		ds_entry.has_shpages_written = true;
+
 		name = "dump";
 	} else if (what == RESTORE_STATS) {
 		stats.restore = &rs_entry;
@@ -194,7 +215,15 @@ void write_stats(int what)
 int init_stats(int what)
 {
 	if (what == DUMP_STATS) {
-		dstats = xzalloc(sizeof(*dstats));
+		/*
+		 * Dumping happens via one process most of the time,
+		 * so we are typically OK with the plain malloc, but
+		 * when dumping namespaces we fork() a separate process
+		 * for it and when it goes and dumps shmem segments
+		 * it will alter the CNT_SHPAGES_ counters, so we need
+		 * to have them in shmem.
+		 */
+		dstats = shmalloc(sizeof(*dstats));
 		return dstats ? 0 : -1;
 	}
 

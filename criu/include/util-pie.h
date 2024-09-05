@@ -4,11 +4,12 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 
-#define UNIX_PATH_MAX (sizeof(struct sockaddr_un) - \
-			(size_t)((struct sockaddr_un *) 0)->sun_path)
+#ifndef UNIX_PATH_MAX
+#define UNIX_PATH_MAX (sizeof(struct sockaddr_un) - (size_t)((struct sockaddr_un *)0)->sun_path)
+#endif
 
 #ifndef SO_PEEK_OFF
-#define SO_PEEK_OFF            42
+#define SO_PEEK_OFF 42
 #endif
 
 #include "common/scm.h"

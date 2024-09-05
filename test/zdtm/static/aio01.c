@@ -10,20 +10,20 @@
 
 #include "zdtmtst.h"
 
-const char *test_doc	= "Check head and tail restore correct";
-const char *test_author	= "Kirill Tkhai <ktkhai@virtuozzo.com>";
+const char *test_doc = "Check head and tail restore correct";
+const char *test_author = "Kirill Tkhai <ktkhai@virtuozzo.com>";
 
 struct aio_ring {
-	unsigned	id;     /* kernel internal index number */
-	unsigned	nr;     /* number of io_events */
-	unsigned	head;   /* Written to by userland or under ring_lock
+	unsigned id;   /* kernel internal index number */
+	unsigned nr;   /* number of io_events */
+	unsigned head; /* Written to by userland or under ring_lock
 				 * mutex by aio_read_events_ring(). */
-	unsigned	tail;
-	unsigned	magic;
-	unsigned	compat_features;
-	unsigned	incompat_features;
-	unsigned	header_length;	/* size of aio_ring */
-	struct io_event	io_events[0];
+	unsigned tail;
+	unsigned magic;
+	unsigned compat_features;
+	unsigned incompat_features;
+	unsigned header_length; /* size of aio_ring */
+	struct io_event io_events[0];
 }; /* 128 bytes + ring size */
 
 int main(int argc, char **argv)
@@ -91,7 +91,7 @@ int main(int argc, char **argv)
 	test_msg("tail=%u, head=%u, nr=%u\n", tail[1], head[1], nr[1]);
 
 	if (tail[0] != tail[1] || head[0] != head[1] || nr[0] != nr[1]) {
-		fail("missmatch");
+		fail("mismatch");
 		return 1;
 	}
 

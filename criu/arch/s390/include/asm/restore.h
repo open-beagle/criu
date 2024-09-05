@@ -7,6 +7,7 @@
 /*
  * Load stack to %r15, return address in %r14 and argument 1 into %r2
  */
+/* clang-format off */
 #define JUMP_TO_RESTORER_BLOB(new_sp, restore_task_exec_start,		\
 			      task_args)				\
 	asm volatile(							\
@@ -18,7 +19,8 @@
 		: "d" (new_sp),						\
 		  "d"((unsigned long)restore_task_exec_start),		\
 		  "d" (task_args)					\
-		: "2", "14", "15", "memory")
+		: "2", "14", "memory")
+/* clang-format on */
 
 /* There is nothing to do since TLS is accessed through %a01 */
 #define core_get_tls(pcore, ptls)

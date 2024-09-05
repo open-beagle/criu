@@ -1,13 +1,17 @@
+#!/bin/bash
+
 TR="y/ABCDEFGHIJKLMNOPQRSTUVWXYZ/abcdefghijklmnopqrstuvwxyz/"
 
-for x in $(sed -n '/PB_AUTOGEN_START/,/PB_AUTOGEN_STOP/ {
+sed -n '/PB_AUTOGEN_START/,/PB_AUTOGEN_STOP/ {
 		/PB_AUTOGEN_ST/d;
+		/^[ \t]*$/d;
 		s/,.*$//;
 		s/\tPB_//;
 		p;
-	   }' criu/include/protobuf-desc.h); do
-	x_la=$(echo $x | sed $TR)
-	x_uf=$(echo $x | sed -nr 's/^./&#\\\
+	   }' criu/include/protobuf-desc.h | \
+while IFS= read -r x; do
+	x_la=$(echo "$x" | sed $TR)
+	x_uf=$(echo "$x" | sed -nr 's/^./&#\\\
 /;
 		s/_(.)/\\\
 \1#\\\

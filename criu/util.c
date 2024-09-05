@@ -1,15 +1,12 @@
-#define _XOPEN_SOURCE
+#define _XOPEN_SOURCE 500
 
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
 #include <errno.h>
 #include <stdbool.h>
-#include <limits.h>
 #include <signal.h>
 #include <unistd.h>
-#include <errno.h>
-#include <string.h>
 #include <dirent.h>
 #include <sys/sendfile.h>
 #include <fcntl.h>
@@ -19,44 +16,46 @@
 #include <sys/param.h>
 #include <sys/types.h>
 #include <sys/ptrace.h>
-#include <sys/types.h>
-#include <sys/time.h>
-#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
-#include <sys/vfs.h>
-#include <sys/ptrace.h>
-#include <sys/wait.h>
-#include <sys/resource.h>
 #include <sys/wait.h>
 #include <sys/socket.h>
+#include <sys/time.h>
+#include <sys/resource.h>
+#include <netdb.h>
 #include <netinet/in.h>
-#include <netinet/tcp.h>
 #include <sched.h>
-#include <ctype.h>
+#include <ftw.h>
+#include <time.h>
+#include <libgen.h>
 
-#include "bitops.h"
+#include "linux/mount.h"
+
+#include "kerndat.h"
 #include "page.h"
-#include "common/compiler.h"
-#include "common/list.h"
 #include "util.h"
-#include "rst-malloc.h"
 #include "image.h"
 #include "vma.h"
 #include "mem.h"
 #include "namespaces.h"
 #include "criu-log.h"
+#include "syscall.h"
+#include "util-caps.h"
 
 #include "clone-noasan.h"
 #include "cr_options.h"
-#include "servicefd.h"
 #include "cr-service.h"
 #include "files.h"
 #include "pstree.h"
+#include "sched.h"
+#include "mount-v2.h"
 
 #include "cr-errno.h"
+#include "action-scripts.h"
 
-#define VMA_OPT_LEN	128
+#include "compel/infect-util.h"
+
+#define VMA_OPT_LEN 128
 
 static int xatol_base(const char *string, long *number, int base)
 {
@@ -65,8 +64,7 @@ static int xatol_base(const char *string, long *number, int base)
 
 	errno = 0;
 	nr = strtol(string, &endptr, base);
-	if ((errno == ERANGE && (nr == LONG_MAX || nr == LONG_MIN))
-			|| (errno != 0 && nr == 0)) {
+	if ((errno == ERANGE && (nr == LONG_MAX || nr == LONG_MIN)) || (errno != 0 && nr == 0)) {
 		pr_perror("failed to convert string '%s'", string);
 		return -EINVAL;
 	}
@@ -83,7 +81,6 @@ int xatol(const char *string, long *number)
 {
 	return xatol_base(string, number, 10);
 }
-
 
 int xatoi(const char *string, int *number)
 {
@@ -178,9 +175,10 @@ static void vma_opt_str(const struct vma_area *v, char *opt)
 {
 	int p = 0;
 
-#define opt2s(_o, _s)	do {				\
-		if (v->e->status & _o)			\
-			p += sprintf(opt + p, _s " ");	\
+#define opt2s(_o, _s)                                  \
+	do {                                           \
+		if (v->e->status & _o)                 \
+			p += sprintf(opt + p, _s " "); \
 	} while (0)
 
 	opt[p] = '\0';
@@ -200,7 +198,7 @@ static void vma_opt_str(const struct vma_area *v, char *opt)
 #undef opt2s
 }
 
-void pr_vma(unsigned int loglevel, const struct vma_area *vma_area)
+void pr_vma(const struct vma_area *vma_area)
 {
 	char opt[VMA_OPT_LEN];
 	memset(opt, 0, VMA_OPT_LEN);
@@ -209,16 +207,11 @@ void pr_vma(unsigned int loglevel, const struct vma_area *vma_area)
 		return;
 
 	vma_opt_str(vma_area, opt);
-	print_on_level(loglevel, "%#"PRIx64"-%#"PRIx64" (%"PRIi64"K) prot %#x flags %#x fdflags %#o st %#x off %#"PRIx64" "
-			"%s shmid: %#"PRIx64"\n",
-			vma_area->e->start, vma_area->e->end,
-			KBYTES(vma_area_len(vma_area)),
-			vma_area->e->prot,
-			vma_area->e->flags,
-			vma_area->e->fdflags,
-			vma_area->e->status,
-			vma_area->e->pgoff,
-			opt, vma_area->e->shmid);
+	pr_info("%#" PRIx64 "-%#" PRIx64 " (%" PRIi64 "K) prot %#x flags %#x fdflags %#o st %#x off %#" PRIx64 " "
+		"%s shmid: %#" PRIx64 "\n",
+		vma_area->e->start, vma_area->e->end, KBYTES(vma_area_len(vma_area)), vma_area->e->prot,
+		vma_area->e->flags, vma_area->e->fdflags, vma_area->e->status, vma_area->e->pgoff, opt,
+		vma_area->e->shmid);
 }
 
 int close_safe(int *fd)
@@ -241,23 +234,17 @@ int reopen_fd_as_safe(char *file, int line, int new_fd, int old_fd, bool allow_r
 	int tmp;
 
 	if (old_fd != new_fd) {
-		/* make sure we won't clash with an inherit fd */
-		if (inherit_fd_resolve_clash(new_fd) < 0)
-			return -1;
-
-		if (!allow_reuse_fd) {
-			if (fcntl(new_fd, F_GETFD) != -1 || errno != EBADF) {
-				pr_err("fd %d already in use (called at %s:%d)\n",
-					new_fd, file, line);
-				return -1;
-			}
-		}
-
-		tmp = dup2(old_fd, new_fd);
+		if (!allow_reuse_fd)
+			tmp = fcntl(old_fd, F_DUPFD, new_fd);
+		else
+			tmp = dup2(old_fd, new_fd);
 		if (tmp < 0) {
-			pr_perror("Dup %d -> %d failed (called at %s:%d)",
-				  old_fd, new_fd, file, line);
+			pr_perror("Dup %d -> %d failed (called at %s:%d)", old_fd, new_fd, file, line);
 			return tmp;
+		} else if (tmp != new_fd) {
+			close(tmp);
+			pr_err("fd %d already in use (called at %s:%d)\n", new_fd, file, line);
+			return -1;
 		}
 
 		/* Just to have error message if failed */
@@ -294,15 +281,18 @@ int move_fd_from(int *img_fd, int want_fd)
 
 static pid_t open_proc_pid = PROC_NONE;
 static pid_t open_proc_self_pid;
-static int open_proc_self_fd = -1;
 
-void set_proc_self_fd(int fd)
+int set_proc_self_fd(int fd)
 {
-	if (open_proc_self_fd >= 0)
-		close(open_proc_self_fd);
+	int ret;
 
-	open_proc_self_fd = fd;
+	if (fd < 0)
+		return close_service_fd(PROC_SELF_FD_OFF);
+
 	open_proc_self_pid = getpid();
+	ret = install_service_fd(PROC_SELF_FD_OFF, fd);
+
+	return ret;
 }
 
 static inline int set_proc_pid_fd(int pid, int fd)
@@ -314,7 +304,6 @@ static inline int set_proc_pid_fd(int pid, int fd)
 
 	open_proc_pid = pid;
 	ret = install_service_fd(PROC_PID_FD_OFF, fd);
-	close(fd);
 
 	return ret;
 }
@@ -322,10 +311,18 @@ static inline int set_proc_pid_fd(int pid, int fd)
 static inline int get_proc_fd(int pid)
 {
 	if (pid == PROC_SELF) {
-		if (open_proc_self_fd != -1 && open_proc_self_pid != getpid()) {
-			close(open_proc_self_fd);
+		int open_proc_self_fd;
+
+		open_proc_self_fd = get_service_fd(PROC_SELF_FD_OFF);
+		/**
+		 * FIXME in case two processes from different pidnses have the
+		 * same pid from getpid() and one inherited service fds from
+		 * another or they share them by shared fdt - this check will
+		 * not detect that one of them reuses /proc/self of another.
+		 * Everything proc related may break in this case.
+		 */
+		if (open_proc_self_fd >= 0 && open_proc_self_pid != getpid())
 			open_proc_self_fd = -1;
-		}
 		return open_proc_self_fd;
 	} else if (pid == open_proc_pid)
 		return get_service_fd(PROC_PID_FD_OFF);
@@ -340,7 +337,7 @@ int close_pid_proc(void)
 	return 0;
 }
 
-void close_proc()
+void close_proc(void)
 {
 	close_pid_proc();
 	close_service_fd(PROC_FD_OFF);
@@ -348,7 +345,14 @@ void close_proc()
 
 int set_proc_fd(int fd)
 {
-	if (install_service_fd(PROC_FD_OFF, fd) < 0)
+	int _fd;
+
+	_fd = dup(fd);
+	if (_fd < 0) {
+		pr_perror("dup() failed");
+		return -1;
+	}
+	if (install_service_fd(PROC_FD_OFF, _fd) < 0)
 		return -1;
 	return 0;
 }
@@ -365,7 +369,6 @@ static int open_proc_sfd(char *path)
 	}
 
 	ret = install_service_fd(PROC_FD_OFF, fd);
-	close(fd);
 	if (ret < 0)
 		return -1;
 
@@ -410,7 +413,7 @@ inline int open_pid_proc(pid_t pid)
 	}
 
 	if (pid == PROC_SELF)
-		set_proc_self_fd(fd);
+		fd = set_proc_self_fd(fd);
 	else
 		fd = set_proc_pid_fd(pid, fd);
 
@@ -434,235 +437,29 @@ int do_open_proc(pid_t pid, int flags, const char *fmt, ...)
 	return openat(dirfd, path, flags);
 }
 
-/* Max potentially possible fd to be open by criu process */
-int service_fd_rlim_cur;
-/* Base of current process service fds set */
-static int service_fd_base;
-/* Id of current process in shared fdt */
-static int service_fd_id = 0;
-
-int init_service_fd(void)
-{
-	struct rlimit64 rlimit;
-
-	/*
-	 * Service FDs are those that most likely won't
-	 * conflict with any 'real-life' ones
-	 */
-
-	if (syscall(__NR_prlimit64, getpid(), RLIMIT_NOFILE, NULL, &rlimit)) {
-		pr_perror("Can't get rlimit");
-		return -1;
-	}
-
-	service_fd_rlim_cur = (int)rlimit.rlim_cur;
-	service_fd_base = service_fd_rlim_cur;
-	BUG_ON(service_fd_base < SERVICE_FD_MAX);
-
-	return 0;
-}
-
-static int __get_service_fd(enum sfd_type type, int service_fd_id)
-{
-	return service_fd_base - type - SERVICE_FD_MAX * service_fd_id;
-}
-
-int service_fd_min_fd(struct pstree_item *item)
-{
-	struct fdt *fdt = rsti(item)->fdt;
-	int id = 0;
-
-	if (fdt)
-		id = fdt->nr - 1;
-	return service_fd_rlim_cur - (SERVICE_FD_MAX - 1) - SERVICE_FD_MAX * id;
-}
-
-static DECLARE_BITMAP(sfd_map, SERVICE_FD_MAX);
-/*
- * Variable for marking areas of code, where service fds modifications
- * are prohibited. It's used to safe them from reusing their numbers
- * by ordinary files. See install_service_fd() and close_service_fd().
- */
-bool sfds_protected = false;
-
-static void sfds_protection_bug(enum sfd_type type)
-{
-	pr_err("Service fd %u is being modified in protected context\n", type);
-	print_stack_trace(current ? vpid(current) : 0);
-	BUG();
-}
-
-int install_service_fd(enum sfd_type type, int fd)
-{
-	int sfd = __get_service_fd(type, service_fd_id);
-
-	BUG_ON((int)type <= SERVICE_FD_MIN || (int)type >= SERVICE_FD_MAX);
-	if (sfds_protected && !test_bit(type, sfd_map))
-		sfds_protection_bug(type);
-
-	if (dup3(fd, sfd, O_CLOEXEC) != sfd) {
-		pr_perror("Dup %d -> %d failed", fd, sfd);
-		return -1;
-	}
-
-	set_bit(type, sfd_map);
-	return sfd;
-}
-
-int get_service_fd(enum sfd_type type)
-{
-	BUG_ON((int)type <= SERVICE_FD_MIN || (int)type >= SERVICE_FD_MAX);
-
-	if (!test_bit(type, sfd_map))
-		return -1;
-
-	return __get_service_fd(type, service_fd_id);
-}
-
-int criu_get_image_dir(void)
-{
-	return get_service_fd(IMG_FD_OFF);
-}
-
-int close_service_fd(enum sfd_type type)
-{
-	int fd;
-
-	if (sfds_protected)
-		sfds_protection_bug(type);
-
-	fd = get_service_fd(type);
-	if (fd < 0)
-		return 0;
-
-	if (close_safe(&fd))
-		return -1;
-
-	clear_bit(type, sfd_map);
-	return 0;
-}
-
-static void move_service_fd(struct pstree_item *me, int type, int new_id, int new_base)
-{
-	int old = get_service_fd(type);
-	int new = new_base - type - SERVICE_FD_MAX * new_id;
-	int ret;
-
-	if (old < 0)
-		return;
-	ret = dup2(old, new);
-	if (ret == -1) {
-		if (errno != EBADF)
-			pr_perror("Unable to clone %d->%d", old, new);
-	} else if (!(rsti(me)->clone_flags & CLONE_FILES))
-		close(old);
-}
-
-static int choose_service_fd_base(struct pstree_item *me)
-{
-	int nr, real_nr, fdt_nr = 1, id = rsti(me)->service_fd_id;
-
-	if (rsti(me)->fdt) {
-		/* The base is set by owner of fdt (id 0) */
-		if (id != 0)
-			return service_fd_base;
-		fdt_nr = rsti(me)->fdt->nr;
-	}
-	/* Now find process's max used fd number */
-	if (!list_empty(&rsti(me)->fds))
-		nr = list_entry(rsti(me)->fds.prev,
-				struct fdinfo_list_entry, ps_list)->fe->fd;
-	else
-		nr = -1;
-
-	nr = max(nr, inh_fd_max);
-	/*
-	 * Service fds go after max fd near right border of alignment:
-	 *
-	 * ...|max_fd|max_fd+1|...|sfd first|...|sfd last (aligned)|
-	 *
-	 * So, they take maximum numbers of area allocated by kernel.
-	 * See linux alloc_fdtable() for details.
-	 */
-	nr += (SERVICE_FD_MAX - SERVICE_FD_MIN) * fdt_nr;
-	nr += 16; /* Safety pad */
-	real_nr = nr;
-
-	nr /= (1024 / sizeof(void *));
-	if (nr)
-		nr = 1 << (32 - __builtin_clz(nr));
-	else
-		nr = 1;
-	nr *= (1024 / sizeof(void *));
-
-	if (nr > service_fd_rlim_cur) {
-		/* Right border is bigger, than rlim. OK, then just aligned value is enough */
-		nr = round_down(service_fd_rlim_cur, (1024 / sizeof(void *)));
-		if (nr < real_nr) {
-			pr_err("Can't chose service_fd_base: %d %d\n", nr, real_nr);
-			return -1;
-		}
-	}
-
-	return nr;
-}
-
-int clone_service_fd(struct pstree_item *me)
-{
-	int id, new_base, i, ret = -1;
-
-	new_base = choose_service_fd_base(me);
-	id = rsti(me)->service_fd_id;
-
-	if (new_base == -1)
-		return -1;
-	if (service_fd_base == new_base && service_fd_id == id)
-		return 0;
-
-	/* Dup sfds in memmove() style: they may overlap */
-	if (get_service_fd(LOG_FD_OFF) < new_base - LOG_FD_OFF - SERVICE_FD_MAX * id)
-		for (i = SERVICE_FD_MIN + 1; i < SERVICE_FD_MAX; i++)
-			move_service_fd(me, i, id, new_base);
-	else
-		for (i = SERVICE_FD_MAX - 1; i > SERVICE_FD_MIN; i--)
-			move_service_fd(me, i, id, new_base);
-
-	service_fd_base = new_base;
-	service_fd_id = id;
-	ret = 0;
-
-	return ret;
-}
-
-bool is_any_service_fd(int fd)
-{
-	return fd > __get_service_fd(SERVICE_FD_MAX, service_fd_id) &&
-		fd < __get_service_fd(SERVICE_FD_MIN, service_fd_id);
-}
-
-bool is_service_fd(int fd, enum sfd_type type)
-{
-	return fd == get_service_fd(type);
-}
-
 int copy_file(int fd_in, int fd_out, size_t bytes)
 {
 	ssize_t written = 0;
 	size_t chunk = bytes ? bytes : 4096;
+	ssize_t ret;
 
 	while (1) {
-		ssize_t ret;
-
-		ret = sendfile(fd_out, fd_in, NULL, chunk);
+		/*
+		 * When fd_out is a pipe, sendfile() returns -EINVAL, so we
+		 * fallback to splice(). Not sure why.
+		 */
+		if (opts.stream)
+			ret = splice(fd_in, NULL, fd_out, NULL, chunk, SPLICE_F_MOVE);
+		else
+			ret = sendfile(fd_out, fd_in, NULL, chunk);
 		if (ret < 0) {
-			pr_perror("Can't send data to ghost file");
+			pr_perror("Can't transfer data to ghost file from image");
 			return -1;
 		}
 
 		if (ret == 0) {
 			if (bytes && (written != bytes)) {
-				pr_err("Ghost file size mismatch %zu/%zu\n",
-						written, bytes);
+				pr_err("Ghost file size mismatch %zu/%zu\n", written, bytes);
 				return -1;
 			}
 			break;
@@ -701,15 +498,15 @@ int is_anon_link_type(char *link, char *type)
 	return !strcmp(link, aux);
 }
 
-#define DUP_SAFE(fd, out)						\
-	({							\
-		int ret__;					\
-		ret__ = dup(fd);				\
-		if (ret__ == -1) {				\
-			pr_perror("dup(%d) failed", fd);	\
-			goto out;				\
-		}						\
-		ret__;						\
+#define DUP_SAFE(fd, out)                                \
+	({                                               \
+		int ret__;                               \
+		ret__ = dup(fd);                         \
+		if (ret__ == -1) {                       \
+			pr_perror("dup(%d) failed", fd); \
+			goto out;                        \
+		}                                        \
+		ret__;                                   \
 	})
 
 /*
@@ -721,8 +518,41 @@ int cr_system(int in, int out, int err, char *cmd, char *const argv[], unsigned 
 	return cr_system_userns(in, out, err, cmd, argv, flags, -1);
 }
 
-int cr_system_userns(int in, int out, int err, char *cmd,
-			char *const argv[], unsigned flags, int userns_pid)
+static int close_fds(int minfd)
+{
+	DIR *dir;
+	struct dirent *de;
+	int fd, ret, dfd;
+
+	dir = opendir("/proc/self/fd");
+	if (dir == NULL) {
+		pr_perror("Can't open /proc/self/fd");
+		return -1;
+	}
+	dfd = dirfd(dir);
+
+	while ((de = readdir(dir))) {
+		if (dir_dots(de))
+			continue;
+
+		ret = sscanf(de->d_name, "%d", &fd);
+		if (ret != 1) {
+			pr_err("Can't parse %s\n", de->d_name);
+			return -1;
+		}
+		if (dfd == fd)
+			continue;
+		if (fd < minfd)
+			continue;
+		/* coverity[double_close] */
+		close(fd);
+	}
+	closedir(dir);
+
+	return 0;
+}
+
+int cr_system_userns(int in, int out, int err, char *cmd, char *const argv[], unsigned flags, int userns_pid)
 {
 	sigset_t blockmask, oldmask;
 	int ret = -1, status;
@@ -731,7 +561,7 @@ int cr_system_userns(int in, int out, int err, char *cmd,
 	sigemptyset(&blockmask);
 	sigaddset(&blockmask, SIGCHLD);
 	if (sigprocmask(SIG_BLOCK, &blockmask, &oldmask) == -1) {
-		pr_perror("Can not set mask of blocked signals");
+		pr_perror("Cannot set mask of blocked signals");
 		return -1;
 	}
 
@@ -740,6 +570,12 @@ int cr_system_userns(int in, int out, int err, char *cmd,
 		pr_perror("fork() failed");
 		goto out;
 	} else if (pid == 0) {
+		sigemptyset(&blockmask);
+		if (sigprocmask(SIG_SETMASK, &blockmask, NULL) == -1) {
+			pr_perror("Cannot clear blocked signals");
+			goto out_chld;
+		}
+
 		if (userns_pid > 0) {
 			if (switch_ns(userns_pid, &user_ns_desc, NULL))
 				goto out_chld;
@@ -764,8 +600,7 @@ int cr_system_userns(int in, int out, int err, char *cmd,
 		if (out == in)
 			out = DUP_SAFE(out, out_chld);
 
-		if (move_fd_from(&out, STDIN_FILENO) ||
-		    move_fd_from(&err, STDIN_FILENO))
+		if (move_fd_from(&out, STDIN_FILENO) || move_fd_from(&err, STDIN_FILENO))
 			goto out_chld;
 
 		if (in < 0) {
@@ -784,10 +619,14 @@ int cr_system_userns(int in, int out, int err, char *cmd,
 		if (reopen_fd_as_nocheck(STDERR_FILENO, err))
 			goto out_chld;
 
+		close_fds(STDERR_FILENO + 1);
+
 		execvp(cmd, argv);
 
-		pr_perror("exec(%s, ...) failed", cmd);
-out_chld:
+		/* We can't use pr_error() as log file fd is closed. */
+		fprintf(stderr, "Error (%s:%d): " LOG_PREFIX "execvp(\"%s\", ...) failed: %s\n", __FILE__, __LINE__,
+			cmd, strerror(errno));
+	out_chld:
 		_exit(1);
 	}
 
@@ -803,8 +642,7 @@ out_chld:
 				pr_err("exited, status=%d\n", WEXITSTATUS(status));
 			break;
 		} else if (WIFSIGNALED(status)) {
-			pr_err("killed by signal %d: %s\n", WTERMSIG(status),
-				strsignal(WTERMSIG(status)));
+			pr_err("killed by signal %d: %s\n", WTERMSIG(status), strsignal(WTERMSIG(status)));
 			break;
 		} else if (WIFSTOPPED(status)) {
 			pr_err("stopped by signal %d\n", WSTOPSIG(status));
@@ -823,9 +661,85 @@ out:
 	return ret;
 }
 
-int close_status_fd(void)
+struct child_args {
+	int *sk_pair;
+	int (*child_setup)(void);
+};
+
+static int child_func(void *_args)
+{
+	struct child_args *args = _args;
+	int sk, *sk_pair = args->sk_pair;
+	char c = 0;
+
+	sk = sk_pair[1];
+	close(sk_pair[0]);
+
+	if (args->child_setup && args->child_setup() != 0)
+		exit(1);
+
+	if (write(sk, &c, 1) != 1) {
+		pr_perror("write");
+		exit(1);
+	}
+
+	while (1)
+		sleep(1000);
+	exit(1);
+}
+
+pid_t fork_and_ptrace_attach(int (*child_setup)(void))
+{
+	pid_t pid;
+	int sk_pair[2], sk;
+	char c = 0;
+	struct child_args cargs = {
+		.sk_pair = sk_pair,
+		.child_setup = child_setup,
+	};
+
+	if (socketpair(PF_LOCAL, SOCK_SEQPACKET, 0, sk_pair)) {
+		pr_perror("socketpair");
+		return -1;
+	}
+
+	pid = clone_noasan(child_func, CLONE_UNTRACED | SIGCHLD, &cargs);
+	if (pid < 0) {
+		pr_perror("fork");
+		return -1;
+	}
+
+	sk = sk_pair[0];
+	close(sk_pair[1]);
+
+	if (read(sk, &c, 1) != 1) {
+		close(sk);
+		kill(pid, SIGKILL);
+		waitpid(pid, NULL, 0);
+		pr_perror("read");
+		return -1;
+	}
+
+	close(sk);
+
+	if (ptrace(PTRACE_ATTACH, pid, NULL, NULL) == -1) {
+		pr_perror("Unable to ptrace the child");
+		kill(pid, SIGKILL);
+		waitpid(pid, NULL, 0);
+		return -1;
+	}
+
+	waitpid(pid, NULL, 0);
+
+	return pid;
+}
+
+int status_ready(void)
 {
 	char c = 0;
+
+	if (run_scripts(ACT_STATUS_READY))
+		return -1;
 
 	if (opts.status_fd < 0)
 		return 0;
@@ -838,7 +752,7 @@ int close_status_fd(void)
 	return close_safe(&opts.status_fd);
 }
 
-int cr_daemon(int nochdir, int noclose, int *keep_fd, int close_fd)
+int cr_daemon(int nochdir, int noclose, int close_fd)
 {
 	int pid;
 
@@ -861,16 +775,6 @@ int cr_daemon(int nochdir, int noclose, int *keep_fd, int close_fd)
 		if (close_fd != -1)
 			close(close_fd);
 
-		if ((*keep_fd != -1) && (*keep_fd != 3)) {
-			fd = dup2(*keep_fd, 3);
-			if (fd < 0) {
-				pr_perror("Dup2 failed");
-				return -1;
-			}
-			close(*keep_fd);
-			*keep_fd = fd;
-		}
-
 		fd = open("/dev/null", O_RDWR);
 		if (fd < 0) {
 			pr_perror("Can't open /dev/null");
@@ -885,7 +789,7 @@ int cr_daemon(int nochdir, int noclose, int *keep_fd, int close_fd)
 	return 0;
 }
 
-int is_root_user()
+int is_root_user(void)
 {
 	if (geteuid() != 0) {
 		pr_err("You need to be root to run this command\n");
@@ -895,6 +799,16 @@ int is_root_user()
 	return 1;
 }
 
+/*
+ * is_empty_dir will always close the FD dirfd: either implicitly
+ * via closedir or explicitly in case fdopendir had failed
+ *
+ * return values:
+ *   < 0 : open directory stream failed
+ *     0 : directory is not empty
+ *     1 : directory is empty
+ */
+
 int is_empty_dir(int dirfd)
 {
 	int ret = 0;
@@ -902,8 +816,11 @@ int is_empty_dir(int dirfd)
 	struct dirent *de;
 
 	fdir = fdopendir(dirfd);
-	if (!fdir)
+	if (!fdir) {
+		pr_perror("open directory stream by fd %d failed", dirfd);
+		close_safe(&dirfd);
 		return -1;
+	}
 
 	while ((de = readdir(fdir))) {
 		if (dir_dots(de))
@@ -1048,6 +965,89 @@ FILE *fopenat(int dirfd, char *path, char *cflags)
 	return fdopen(tmp, cflags);
 }
 
+int cr_fchown(int fd, uid_t new_uid, gid_t new_gid)
+{
+	struct stat st;
+
+	if (!fchown(fd, new_uid, new_gid))
+		return 0;
+	if (errno != EPERM)
+		return -1;
+
+	if (fstat(fd, &st) < 0) {
+		pr_perror("fstat() after fchown() for fd %d", fd);
+		goto out_eperm;
+	}
+	pr_debug("fstat(%d): uid %u gid %u\n", fd, st.st_uid, st.st_gid);
+
+	if (new_uid != st.st_uid || new_gid != st.st_gid)
+		goto out_eperm;
+
+	return 0;
+out_eperm:
+	errno = EPERM;
+	return -1;
+}
+
+int cr_fchpermat(int dirfd, const char *path, uid_t new_uid, gid_t new_gid, mode_t new_mode, int flags)
+{
+	struct stat st;
+	int ret;
+
+	if (fchownat(dirfd, path, new_uid, new_gid, flags) < 0 && errno != EPERM) {
+		int errno_cpy = errno;
+		pr_perror("Unable to change [%d]/%s ownership to (%d, %d)",
+			  dirfd, path, new_uid, new_gid);
+		errno = errno_cpy;
+		return -1;
+	}
+
+	if (fstatat(dirfd, path, &st, flags) < 0) {
+		int errno_cpy = errno;
+		pr_perror("Unable to stat [%d]/%s", dirfd, path);
+		errno = errno_cpy;
+		return -1;
+	}
+
+	if (new_uid != st.st_uid || new_gid != st.st_gid) {
+		errno = EPERM;
+		pr_perror("Unable to change [%d]/%s ownership (%d, %d) to (%d, %d)",
+			  dirfd, path, st.st_uid, st.st_gid, new_uid, new_gid);
+		errno = EPERM;
+		return -1;
+	}
+
+	if (new_mode == st.st_mode)
+		return 0;
+
+	if (S_ISLNK(st.st_mode)) {
+		/*
+		 * We have no lchmod() function, and fchmod() will fail on
+		 * O_PATH | O_NOFOLLOW fd. Yes, we have fchmodat()
+		 * function and flag AT_SYMLINK_NOFOLLOW described in
+		 * man 2 fchmodat, but it is not currently implemented. %)
+		 */
+		return 0;
+	}
+
+	if (!*path && flags & AT_EMPTY_PATH)
+		ret = fchmod(dirfd, new_mode);
+	else
+		ret = fchmodat(dirfd, path, new_mode, flags & ~(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH));
+	if (ret < 0) {
+		int errno_cpy = errno;
+		pr_perror("Unable to set perms %o on [%d]/%s", new_mode, dirfd, path);
+		errno = errno_cpy;
+	}
+
+	return ret;
+}
+
+int cr_fchperm(int fd, uid_t new_uid, gid_t new_gid, mode_t new_mode)
+{
+	return cr_fchpermat(fd, "", new_uid, new_gid, new_mode, AT_EMPTY_PATH);
+}
+
 void split(char *str, char token, char ***out, int *n)
 {
 	int i;
@@ -1059,12 +1059,17 @@ void split(char *str, char token, char ***out, int *n)
 		cur++;
 	}
 
+	if (*n == 0) {
+		/* This can only happen if str == NULL */
+		*out = NULL;
+		*n = -1;
+		return;
+	}
 
 	*out = xmalloc((*n) * sizeof(char *));
 	if (!*out) {
 		*n = -1;
 		return;
-
 	}
 
 	cur = str;
@@ -1092,12 +1097,12 @@ void split(char *str, char token, char ***out, int *n)
 		}
 
 		i++;
-	} while(cur);
+	} while (cur);
 }
 
 int fd_has_data(int lfd)
 {
-	struct pollfd pfd = {lfd, POLLIN, 0};
+	struct pollfd pfd = { lfd, POLLIN, 0 };
 	int ret;
 
 	ret = poll(&pfd, 1, 0);
@@ -1106,6 +1111,24 @@ int fd_has_data(int lfd)
 	}
 
 	return ret;
+}
+
+void fd_set_nonblocking(int fd, bool on)
+{
+	int flags = fcntl(fd, F_GETFL, NULL);
+
+	if (flags < 0) {
+		pr_perror("Failed to obtain flags from fd %d", fd);
+		return;
+	}
+
+	if (on)
+		flags |= O_NONBLOCK;
+	else
+		flags &= (~O_NONBLOCK);
+
+	if (fcntl(fd, F_SETFL, flags) < 0)
+		pr_perror("Failed to set flags for fd %d", fd);
 }
 
 int make_yard(char *path)
@@ -1138,129 +1161,64 @@ const char *ns_to_string(unsigned int ns)
 		return "user";
 	case CLONE_NEWUTS:
 		return "uts";
+	case CLONE_NEWTIME:
+		return "time";
 	default:
 		return NULL;
 	}
 }
 
-void tcp_cork(int sk, bool on)
-{
-	int val = on ? 1 : 0;
-	if (setsockopt(sk, SOL_TCP, TCP_CORK, &val, sizeof(val)))
-		pr_perror("Unable to restore TCP_CORK (%d)", val);
-}
-
-void tcp_nodelay(int sk, bool on)
-{
-	int val = on ? 1 : 0;
-	if (setsockopt(sk, SOL_TCP, TCP_NODELAY, &val, sizeof(val)))
-		pr_perror("Unable to restore TCP_NODELAY (%d)", val);
-}
-
-static inline void pr_xsym(unsigned char *data, size_t len, int pos)
-{
-	char sym;
-
-	if (pos < len)
-		sym = data[pos];
-	else
-		sym = ' ';
-
-	pr_msg("%c", isprint(sym) ? sym : '.');
-}
-
-static inline void pr_xdigi(unsigned char *data, size_t len, int pos)
-{
-	if (pos < len)
-		pr_msg("%02x ", data[pos]);
-	else
-		pr_msg("   ");
-}
-
-static int nice_width_for(unsigned long addr)
-{
-	int ret = 3;
-
-	while (addr) {
-		addr >>= 4;
-		ret++;
-	}
-
-	return ret;
-}
-
-void print_data(unsigned long addr, unsigned char *data, size_t size)
-{
-	int i, j, addr_len;
-	unsigned zero_line = 0;
-
-	addr_len = nice_width_for(addr + size);
-
-	for (i = 0; i < size; i += 16) {
-		if (*(u64 *)(data + i) == 0 && *(u64 *)(data + i + 8) == 0) {
-			if (zero_line == 0)
-				zero_line = 1;
-			else {
-				if (zero_line == 1) {
-					pr_msg("*\n");
-					zero_line = 2;
-				}
-
-				continue;
-			}
-		} else
-			zero_line = 0;
-
-		pr_msg("%#0*lx: ", addr_len, addr + i);
-		for (j = 0; j < 8; j++)
-			pr_xdigi(data, size, i + j);
-		pr_msg(" ");
-		for (j = 8; j < 16; j++)
-			pr_xdigi(data, size, i + j);
-
-		pr_msg(" |");
-		for (j = 0; j < 8; j++)
-			pr_xsym(data, size, i + j);
-		pr_msg(" ");
-		for (j = 8; j < 16; j++)
-			pr_xsym(data, size, i + j);
-
-		pr_msg("|\n");
-	}
-}
-
-static int get_sockaddr_in(struct sockaddr_in *addr, char *host)
+static int get_sockaddr_in(struct sockaddr_storage *addr, char *host, unsigned short port)
 {
 	memset(addr, 0, sizeof(*addr));
-	addr->sin_family = AF_INET;
 
-	if (!host)
-		addr->sin_addr.s_addr = INADDR_ANY;
-	else if (!inet_aton(host, &addr->sin_addr)) {
-		pr_perror("Bad server address");
+	if (!host) {
+		((struct sockaddr_in *)addr)->sin_addr.s_addr = INADDR_ANY;
+		addr->ss_family = AF_INET;
+	} else if (inet_pton(AF_INET, host, &((struct sockaddr_in *)addr)->sin_addr)) {
+		addr->ss_family = AF_INET;
+	} else if (inet_pton(AF_INET6, host, &((struct sockaddr_in6 *)addr)->sin6_addr)) {
+		addr->ss_family = AF_INET6;
+	} else {
+		pr_err("Invalid server address \"%s\". "
+		       "The address must be in IPv4 or IPv6 format.\n",
+		       host);
 		return -1;
 	}
 
-	addr->sin_port = opts.port;
+	if (addr->ss_family == AF_INET6) {
+		((struct sockaddr_in6 *)addr)->sin6_port = htons(port);
+	} else if (addr->ss_family == AF_INET) {
+		((struct sockaddr_in *)addr)->sin_port = htons(port);
+	}
+
 	return 0;
 }
 
-int setup_tcp_server(char *type)
+int setup_tcp_server(char *type, char *addr, unsigned short *port)
 {
 	int sk = -1;
-	struct sockaddr_in saddr;
+	int sockopt = 1;
+	struct sockaddr_storage saddr;
 	socklen_t slen = sizeof(saddr);
 
-	pr_info("Starting %s server on port %u\n", type, (int)ntohs(opts.port));
+	if (get_sockaddr_in(&saddr, addr, (*port))) {
+		return -1;
+	}
 
-	sk = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP);
+	pr_info("Starting %s server on port %u\n", type, *port);
+
+	sk = socket(saddr.ss_family, SOCK_STREAM, IPPROTO_TCP);
+
 	if (sk < 0) {
 		pr_perror("Can't init %s server", type);
 		return -1;
 	}
 
-	if (get_sockaddr_in(&saddr, opts.addr))
+	if (setsockopt(sk, SOL_SOCKET, SO_REUSEADDR, &sockopt, sizeof(sockopt)) == -1) {
+		pr_perror("Unable to set SO_REUSEADDR");
 		goto out;
+	}
 
 	if (bind(sk, (struct sockaddr *)&saddr, slen)) {
 		pr_perror("Can't bind %s server", type);
@@ -1273,14 +1231,19 @@ int setup_tcp_server(char *type)
 	}
 
 	/* Get socket port in case of autobind */
-	if (opts.port == 0) {
+	if ((*port) == 0) {
 		if (getsockname(sk, (struct sockaddr *)&saddr, &slen)) {
 			pr_perror("Can't get %s server name", type);
 			goto out;
 		}
 
-		opts.port = ntohs(saddr.sin_port);
-		pr_info("Using %u port\n", opts.port);
+		if (saddr.ss_family == AF_INET6) {
+			(*port) = ntohs(((struct sockaddr_in6 *)&saddr)->sin6_port);
+		} else if (saddr.ss_family == AF_INET) {
+			(*port) = ntohs(((struct sockaddr_in *)&saddr)->sin_port);
+		}
+
+		pr_info("Using %u port\n", (*port));
 	}
 
 	return sk;
@@ -1292,14 +1255,14 @@ out:
 int run_tcp_server(bool daemon_mode, int *ask, int cfd, int sk)
 {
 	int ret;
-	struct sockaddr_in caddr;
+	struct sockaddr_storage caddr;
 	socklen_t clen = sizeof(caddr);
 
 	if (daemon_mode) {
-		ret = cr_daemon(1, 0, ask, cfd);
+		ret = cr_daemon(1, 0, cfd);
 		if (ret == -1) {
 			pr_err("Can't run in the background\n");
-			goto out;
+			goto err;
 		}
 		if (ret > 0) { /* parent task, daemon started */
 			close_safe(&sk);
@@ -1316,48 +1279,92 @@ int run_tcp_server(bool daemon_mode, int *ask, int cfd, int sk)
 		}
 	}
 
-	if (close_status_fd())
+	if (status_ready())
 		return -1;
 
 	if (sk >= 0) {
-		ret = *ask = accept(sk, (struct sockaddr *)&caddr, &clen);
-		if (*ask < 0)
+		char port[6];
+		char address[INET6_ADDRSTRLEN];
+		*ask = accept(sk, (struct sockaddr *)&caddr, &clen);
+		if (*ask < 0) {
 			pr_perror("Can't accept connection to server");
-		else
-			pr_info("Accepted connection from %s:%u\n",
-					inet_ntoa(caddr.sin_addr),
-					(int)ntohs(caddr.sin_port));
+			goto err;
+		}
+		ret = getnameinfo((struct sockaddr *)&caddr, clen, address, sizeof(address), port, sizeof(port),
+				  NI_NUMERICHOST | NI_NUMERICSERV);
+		if (ret) {
+			pr_err("Failed converting address: %s\n", gai_strerror(ret));
+			goto err;
+		}
+		pr_info("Accepted connection from %s:%s\n", address, port);
 		close(sk);
 	}
 
 	return 0;
-out:
-	close(sk);
+err:
+	close_safe(&sk);
 	return -1;
 }
 
-int setup_tcp_client(char *addr)
+int setup_tcp_client(char *hostname)
 {
-	struct sockaddr_in saddr;
-	int sk;
+	struct sockaddr_storage saddr;
+	struct addrinfo addr_criteria, *addr_list, *p;
+	char ipstr[INET6_ADDRSTRLEN];
+	int sk = -1;
+	void *ip;
 
-	pr_info("Connecting to server %s:%u\n", addr, (int)ntohs(opts.port));
+	memset(&addr_criteria, 0, sizeof(addr_criteria));
+	addr_criteria.ai_family = AF_UNSPEC;
+	addr_criteria.ai_socktype = SOCK_STREAM;
+	addr_criteria.ai_protocol = IPPROTO_TCP;
 
-	if (get_sockaddr_in(&saddr, addr))
-		return -1;
-
-	sk = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP);
-	if (sk < 0) {
-		pr_perror("Can't create socket");
-		return -1;
+	/*
+	 * addr_list contains a list of addrinfo structures that corresponding
+	 * to the criteria specified in hostname and addr_criteria.
+	 */
+	if (getaddrinfo(hostname, NULL, &addr_criteria, &addr_list)) {
+		pr_perror("Failed to resolve hostname: %s", hostname);
+		goto out;
 	}
 
-	if (connect(sk, (struct sockaddr *)&saddr, sizeof(saddr)) < 0) {
-		pr_perror("Can't connect to server");
-		close(sk);
-		return -1;
+	/*
+	 * Iterate through addr_list and try to connect. The loop stops if the
+	 * connection is successful or we reach the end of the list.
+	 */
+	for (p = addr_list; p != NULL; p = p->ai_next) {
+		if (p->ai_family == AF_INET) {
+			struct sockaddr_in *ipv4 = (struct sockaddr_in *)p->ai_addr;
+			ip = &(ipv4->sin_addr);
+		} else {
+			struct sockaddr_in6 *ipv6 = (struct sockaddr_in6 *)p->ai_addr;
+			ip = &(ipv6->sin6_addr);
+		}
+
+		inet_ntop(p->ai_family, ip, ipstr, sizeof(ipstr));
+		pr_info("Connecting to server %s:%u\n", ipstr, opts.port);
+
+		if (get_sockaddr_in(&saddr, ipstr, opts.port))
+			goto out;
+
+		sk = socket(saddr.ss_family, SOCK_STREAM, IPPROTO_TCP);
+		if (sk < 0) {
+			pr_perror("Can't create socket");
+			goto out;
+		}
+
+		if (connect(sk, (struct sockaddr *)&saddr, sizeof(saddr)) < 0) {
+			pr_info("Can't connect to server %s:%u\n", ipstr, opts.port);
+			close(sk);
+			sk = -1;
+		} else {
+			/* Connected successfully */
+			break;
+		}
 	}
 
+out:
+	freeaddrinfo(addr_list);
 	return sk;
 }
 
@@ -1457,7 +1464,7 @@ int epoll_prepare(int nr_fds, struct epoll_event **events)
 		return -1;
 
 	epollfd = epoll_create(nr_fds);
-	if (epollfd == -1) {
+	if (epollfd < 0) {
 		pr_perror("epoll_create failed");
 		goto free_events;
 	}
@@ -1466,6 +1473,7 @@ int epoll_prepare(int nr_fds, struct epoll_event **events)
 
 free_events:
 	xfree(*events);
+	*events = NULL;
 	return -1;
 }
 
@@ -1477,8 +1485,7 @@ int call_in_child_process(int (*fn)(void *), void *arg)
 	 * Parent freezes till child exit, so child may use the same stack.
 	 * No SIGCHLD flag, so it's not need to block signal.
 	 */
-	pid = clone_noasan(fn, CLONE_VFORK | CLONE_VM | CLONE_FILES |
-			   CLONE_IO | CLONE_SIGHAND | CLONE_SYSVSEM, arg);
+	pid = clone_noasan(fn, CLONE_VFORK | CLONE_VM | CLONE_FILES | CLONE_IO | CLONE_SIGHAND | CLONE_SYSVSEM, arg);
 	if (pid == -1) {
 		pr_perror("Can't clone");
 		return -1;
@@ -1498,6 +1505,25 @@ out:
 	return ret;
 }
 
+void rlimit_unlimit_nofile(void)
+{
+	struct rlimit new;
+
+	if (opts.unprivileged && !has_cap_sys_resource(opts.cap_eff))
+		return;
+
+	new.rlim_cur = kdat.sysctl_nr_open;
+	new.rlim_max = kdat.sysctl_nr_open;
+
+	if (prlimit(getpid(), RLIMIT_NOFILE, &new, NULL)) {
+		pr_perror("rlimit: Can't setup RLIMIT_NOFILE for self");
+		return;
+	} else
+		pr_debug("rlimit: RLIMIT_NOFILE unlimited for self\n");
+
+	service_fd_rlim_cur = kdat.sysctl_nr_open;
+}
+
 #ifdef __GLIBC__
 #include <execinfo.h>
 void print_stack_trace(pid_t pid)
@@ -1515,3 +1541,637 @@ void print_stack_trace(pid_t pid)
 	free(strings);
 }
 #endif
+
+int mount_detached_fs(const char *fsname)
+{
+	int fsfd, fd;
+
+	fsfd = sys_fsopen(fsname, 0);
+	if (fsfd < 0) {
+		pr_perror("Unable to open the %s file system", fsname);
+		return -1;
+	}
+
+	if (sys_fsconfig(fsfd, FSCONFIG_CMD_CREATE, NULL, NULL, 0) < 0) {
+		pr_perror("Unable to create the %s file system", fsname);
+		close(fsfd);
+		return -1;
+	}
+
+	fd = sys_fsmount(fsfd, 0, 0);
+	if (fd < 0)
+		pr_perror("Unable to mount the %s file system", fsname);
+	close(fsfd);
+	return fd;
+}
+
+int strip_deleted(char *name, int len)
+{
+	struct dcache_prepends {
+		const char *str;
+		size_t len;
+	} static const prepends[] = { {
+					      .str = " (deleted)",
+					      .len = 10,
+				      },
+				      {
+					      .str = "//deleted",
+					      .len = 9,
+				      } };
+	size_t i;
+
+	for (i = 0; i < ARRAY_SIZE(prepends); i++) {
+		size_t at;
+
+		if (len <= prepends[i].len)
+			continue;
+
+		at = len - prepends[i].len;
+		if (!strcmp(&name[at], prepends[i].str)) {
+			pr_debug("Strip '%s' tag from '%s'\n", prepends[i].str, name);
+			name[at] = '\0';
+			len -= prepends[i].len;
+			return 1;
+		}
+	}
+	return 0;
+}
+
+/*
+ * This function check if path ends with ending and cuts it from path.
+ * Return 0 if path is cut. -1 otherwise, leaving path unchanged.
+ * Example:
+ *	path = "/foo/bar", ending = "bar"
+ *	cut(path, ending)  -> path becomes "/foo"
+ *
+ * 1. Skip leading "./" in subpath.
+ * 2. Respect root: ("/a/b", "b") -> "/a" but ("/a", "a") -> "/"
+ * 3. Refuse to cut identical strings, e.g. ("abc", "abc") will result in -1
+ * 4. Do not handle "..", "//", "./" (with exception "./" as leading symbols)
+ */
+
+int cut_path_ending(char *path, char *ending)
+{
+	int ending_pos;
+
+	if (ending[0] == '.' && ending[1] == '/')
+		ending = ending + 2;
+
+	ending_pos = strlen(path) - strlen(ending);
+
+	if (ending_pos < 1)
+		return -1;
+
+	if (strcmp(path + ending_pos, ending))
+		return -1;
+
+	if (path[ending_pos - 1] != '/')
+		return -1;
+
+	if (ending_pos == 1) {
+		path[ending_pos] = 0;
+		return 0;
+	}
+
+	path[ending_pos - 1] = 0;
+	return 0;
+}
+
+static int is_iptables_nft(char *bin)
+{
+	int pfd[2] = { -1, -1 }, ret = -1;
+	char *cmd[] = { bin, "-V", NULL };
+	char buf[100];
+
+	if (pipe(pfd) < 0) {
+		pr_perror("Unable to create pipe");
+		goto err;
+	}
+
+	ret = cr_system(-1, pfd[1], -1, cmd[0], cmd, CRS_CAN_FAIL);
+	if (ret) {
+		pr_err("%s -V failed\n", cmd[0]);
+		goto err;
+	}
+
+	close_safe(&pfd[1]);
+
+	ret = read(pfd[0], buf, sizeof(buf) - 1);
+	if (ret < 0) {
+		pr_perror("Unable to read %s -V output", cmd[0]);
+		goto err;
+	}
+
+	buf[ret] = '\0';
+	ret = 0;
+
+	if (strstr(buf, "nf_tables")) {
+		pr_info("iptables has nft backend: %s\n", buf);
+		ret = 1;
+	}
+
+err:
+	close_safe(&pfd[1]);
+	close_safe(&pfd[0]);
+	return ret;
+}
+
+char *get_legacy_iptables_bin(bool ipv6, bool restore)
+{
+	static char iptables_bin[2][2][32];
+	/* 0  - means we don't know yet,
+	 * -1 - not present,
+	 * 1  - present.
+	 */
+	static int iptables_present[2][2] = { { 0, 0 }, { 0, 0 } };
+	char bins[2][2][2][32] = { { { "iptables-save", "iptables-legacy-save" },
+				     { "iptables-restore", "iptables-legacy-restore" } },
+				   { { "ip6tables-save", "ip6tables-legacy-save" },
+				     { "ip6tables-restore", "ip6tables-legacy-restore" } } };
+	int ret;
+
+	if (iptables_present[ipv6][restore] == -1)
+		return NULL;
+
+	if (iptables_present[ipv6][restore] == 1)
+		return iptables_bin[ipv6][restore];
+
+	memcpy(iptables_bin[ipv6][restore], bins[ipv6][restore][0], strlen(bins[ipv6][restore][0]) + 1);
+	ret = is_iptables_nft(iptables_bin[ipv6][restore]);
+
+	/*
+	 * iptables on host uses nft backend (or not installed),
+	 * let's try iptables-legacy
+	 */
+	if (ret < 0 || ret == 1) {
+		memcpy(iptables_bin[ipv6][restore], bins[ipv6][restore][1], strlen(bins[ipv6][restore][1]) + 1);
+		ret = is_iptables_nft(iptables_bin[ipv6][restore]);
+		if (ret < 0 || ret == 1) {
+			iptables_present[ipv6][restore] = -1;
+			return NULL;
+		}
+	}
+
+	/* we can come here with iptables-save or iptables-legacy-save */
+	iptables_present[ipv6][restore] = 1;
+
+	return iptables_bin[ipv6][restore];
+}
+
+/*
+ * read_all() behaves like read() without the possibility of partial reads.
+ * Use only with blocking I/O.
+ */
+ssize_t read_all(int fd, void *buf, size_t size)
+{
+	ssize_t n = 0;
+	while (size > 0) {
+		ssize_t ret = read(fd, buf, size);
+		if (ret == -1) {
+			if (errno == EINTR)
+				continue;
+			/*
+			 * The caller should use standard read() for
+			 * non-blocking I/O.
+			 */
+			if (errno == EAGAIN || errno == EWOULDBLOCK)
+				errno = EINVAL;
+			return ret;
+		}
+		if (ret == 0)
+			break;
+		n += ret;
+		buf = (char *)buf + ret;
+		size -= ret;
+	}
+	return n;
+}
+
+/*
+ * write_all() behaves like write() without the possibility of partial writes.
+ * Use only with blocking I/O.
+ */
+ssize_t write_all(int fd, const void *buf, size_t size)
+{
+	ssize_t n = 0;
+	while (size > 0) {
+		ssize_t ret = write(fd, buf, size);
+		if (ret == -1) {
+			if (errno == EINTR)
+				continue;
+			/*
+			 * The caller should use standard write() for
+			 * non-blocking I/O.
+			 */
+			if (errno == EAGAIN || errno == EWOULDBLOCK)
+				errno = EINVAL;
+			return ret;
+		}
+		n += ret;
+		buf = (char *)buf + ret;
+		size -= ret;
+	}
+	return n;
+}
+
+static int remove_one(const char *fpath, const struct stat *sb, int tflag, struct FTW *ftwbuf)
+{
+	int ret;
+
+	ret = remove(fpath);
+	if (ret) {
+		pr_perror("rmrf: unable to remove %s", fpath);
+		return -1;
+	}
+
+	return 0;
+}
+
+#define NFTW_FD_MAX 64
+
+int rmrf(char *path)
+{
+	pr_debug("rmrf: removing %s\n", path);
+	return nftw(path, remove_one, NFTW_FD_MAX, FTW_DEPTH | FTW_PHYS);
+}
+
+__attribute__((returns_twice)) static pid_t raw_legacy_clone(unsigned long flags, int *pidfd)
+{
+#if defined(__s390x__) || defined(__s390__) || defined(__CRIS__)
+	/* On s390/s390x and cris the order of the first and second arguments
+	 * of the system call is reversed.
+	 */
+	return syscall(__NR_clone, NULL, flags | SIGCHLD, pidfd);
+#elif defined(__sparc__) && defined(__arch64__)
+	{
+		/*
+		 * sparc64 always returns the other process id in %o0, and a
+		 * boolean flag whether this is the child or the parent in %o1.
+		 * Inline assembly is needed to get the flag returned in %o1.
+		 */
+		register long g1 asm("g1") = __NR_clone;
+		register long o0 asm("o0") = flags | SIGCHLD;
+		register long o1 asm("o1") = 0; /* is parent/child indicator */
+		register long o2 asm("o2") = (unsigned long)pidfd;
+		long is_error, retval, in_child;
+		pid_t child_pid;
+
+		asm volatile(
+#if defined(__arch64__)
+			"t 0x6d\n\t" /* 64-bit trap */
+#else
+			"t 0x10\n\t" /* 32-bit trap */
+#endif
+			/*
+		     * catch errors: On sparc, the carry bit (csr) in the
+		     * processor status register (psr) is used instead of a
+		     * full register.
+		     */
+			"addx %%g0, 0, %%g1"
+			: "=r"(g1), "=r"(o0), "=r"(o1), "=r"(o2) /* outputs */
+			: "r"(g1), "r"(o0), "r"(o1), "r"(o2)	 /* inputs */
+			: "%cc");				 /* clobbers */
+
+		is_error = g1;
+		retval = o0;
+		in_child = o1;
+
+		if (is_error) {
+			errno = retval;
+			return -1;
+		}
+
+		if (in_child)
+			return 0;
+
+		child_pid = retval;
+		return child_pid;
+	}
+#elif defined(__ia64__)
+	/* On ia64 the stack and stack size are passed as separate arguments. */
+	return syscall(__NR_clone, flags | SIGCHLD, NULL, 0, pidfd);
+#else
+	return syscall(__NR_clone, flags | SIGCHLD, NULL, pidfd);
+#endif
+}
+
+__attribute__((returns_twice)) static pid_t raw_clone(unsigned long flags, int *pidfd)
+{
+	pid_t pid;
+	struct _clone_args args = {
+		.flags = flags,
+		.pidfd = ptr_to_u64(pidfd),
+	};
+
+	if (flags & (CLONE_VM | CLONE_PARENT_SETTID | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID | CLONE_SETTLS))
+		return -EINVAL;
+
+	/* On CLONE_PARENT we inherit the parent's exit signal. */
+	if (!(flags & CLONE_PARENT))
+		args.exit_signal = SIGCHLD;
+
+	pid = syscall(__NR_clone3, &args, sizeof(args));
+	if (pid < 0 && errno == ENOSYS)
+		return raw_legacy_clone(flags, pidfd);
+
+	return pid;
+}
+
+static int wait_for_pid(pid_t pid)
+{
+	int status, ret;
+
+again:
+	ret = waitpid(pid, &status, 0);
+	if (ret == -1) {
+		if (errno == EINTR)
+			goto again;
+
+		return -1;
+	}
+
+	if (ret != pid)
+		goto again;
+
+	if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+		return -1;
+
+	return 0;
+}
+
+int run_command(char *buf, size_t buf_size, int (*child_fn)(void *), void *args)
+{
+	pid_t child;
+	int ret, fret, pipefd[2];
+	ssize_t bytes;
+
+	/* Make sure our callers do not receive uninitialized memory. */
+	if (buf_size > 0 && buf)
+		buf[0] = '\0';
+
+	if (pipe(pipefd) < 0)
+		return -1;
+
+	child = raw_clone(0, NULL);
+	if (child < 0) {
+		close(pipefd[0]);
+		close(pipefd[1]);
+		return -1;
+	}
+
+	if (child == 0) {
+		/* Close the read-end of the pipe. */
+		close(pipefd[0]);
+
+		/* Redirect std{err,out} to write-end of the
+		 * pipe.
+		 */
+		ret = dup2(pipefd[1], STDOUT_FILENO);
+		if (ret >= 0)
+			ret = dup2(pipefd[1], STDERR_FILENO);
+
+		/* Close the write-end of the pipe. */
+		close(pipefd[1]);
+
+		if (ret < 0)
+			_exit(EXIT_FAILURE);
+
+		/* Does not return. */
+		child_fn(args);
+		_exit(EXIT_FAILURE);
+	}
+
+	/* close the write-end of the pipe */
+	close(pipefd[1]);
+
+	if (buf && buf_size > 0) {
+		bytes = read_all(pipefd[0], buf, buf_size - 1);
+		if (bytes > 0)
+			buf[bytes - 1] = '\0';
+	}
+
+	fret = wait_for_pid(child);
+
+	/* close the read-end of the pipe */
+	close(pipefd[0]);
+
+	return fret;
+}
+
+uint64_t criu_run_id;
+
+void util_init(void)
+{
+	struct stat statbuf;
+
+	criu_run_id = getpid();
+	if (!stat("/proc/self/ns/pid", &statbuf))
+		criu_run_id |= (uint64_t)statbuf.st_ino << 32;
+	else if (errno != ENOENT)
+		pr_perror("Can't stat /proc/self/ns/pid - CRIU run id might not be unique");
+
+	compel_run_id = criu_run_id;
+	pr_info("CRIU run id = %#" PRIx64 "\n", criu_run_id);
+}
+
+/*
+ * This function cuts sub_path from the path.
+ * 1) It assumes all relative paths given are relative to "/":
+ * 	/a/b/c is the same as a/b/c
+ * 2) It can handle paths with multiple consequent slashes:
+ * 	///a///b///c is the same as /a/b/c
+ * 3) It always returns relative path, with no leading slash:
+ * 	get_relative_path("/a/b/c", "/") would be "a/b/c"
+ * 	get_relative_path("/a/b/c", "/a/b") would be "c"
+ * 	get_relative_path("/", "/") would be ""
+ * 4) It can handle paths with single dots:
+ * 	get_relative_path("./a/b", "a/") would be "b"
+ * 5) Note ".." in paths are not supported and handled as normal directory name
+ */
+char *get_relative_path(char *path, char *sub_path)
+{
+	bool skip_slashes = true;
+
+	while (1) {
+		if ((*path == '/' || *path == '\0') && (*sub_path == '/' || *sub_path == '\0'))
+			skip_slashes = true;
+
+		if (skip_slashes) {
+			while (*path == '/' || (path[0] == '.' && (path[1] == '/' || path[1] == '\0')))
+				path++;
+			while (*sub_path == '/' || (sub_path[0] == '.' && (sub_path[1] == '/' || sub_path[1] == '\0')))
+				sub_path++;
+		}
+
+		if (*sub_path == '\0') {
+			if (skip_slashes)
+				return path;
+			return NULL;
+		}
+		skip_slashes = false;
+
+		if (*path == '\0')
+			return NULL;
+
+		if (*path != *sub_path)
+			return NULL;
+
+		path++;
+		sub_path++;
+	}
+
+	/* will never get here */
+	return NULL;
+}
+
+bool is_sub_path(char *path, char *sub_path)
+{
+	char *rel_path;
+
+	rel_path = get_relative_path(path, sub_path);
+	if (!rel_path)
+		return false;
+
+	return true;
+}
+
+bool is_same_path(char *path1, char *path2)
+{
+	char *rel_path;
+
+	rel_path = get_relative_path(path1, path2);
+	if (!rel_path || *rel_path != '\0')
+		return false;
+
+	return true;
+}
+
+/*
+ * Checks if path is a mountpoint
+ * (path should be visible - no overmounts)
+ */
+static int path_is_mountpoint(char *path, bool *is_mountpoint)
+{
+	char *dname, *bname, *free_name;
+	struct open_how how = {
+		.flags = O_PATH,
+		.resolve = RESOLVE_NO_XDEV,
+	};
+	int exit_code = -1;
+	int dfd, fd;
+
+	dname = free_name = xstrdup(path);
+	if (!dname)
+		return -1;
+	dname = dirname(dname);
+
+	bname = get_relative_path(path, dname);
+	if (!bname || *bname == '\0') {
+		pr_err("Failed to get bname for %s\n", path);
+		goto err_free;
+	}
+
+	dfd = open(dname, O_PATH);
+	if (dfd < 0) {
+		pr_perror("Failed to open dir %s", dname);
+		goto err_free;
+	}
+
+	fd = sys_openat2(dfd, bname, &how, sizeof(how));
+	if (fd < 0) {
+		if (errno != EXDEV) {
+			pr_perror("Failed to open %s at %s", bname, dname);
+			goto err_close;
+		}
+
+		/*
+		 * EXDEV means that dfd and bname are from different
+		 * mounts, meaning that bname is a mountpoint
+		 */
+		*is_mountpoint = true;
+	} else {
+		/*
+		 * No error means that dfd and bname are from same mount,
+		 * meaning that bname is not a mountpoint
+		 */
+		*is_mountpoint = false;
+		close(fd);
+	}
+
+	exit_code = 0;
+err_close:
+	close(dfd);
+err_free:
+	xfree(free_name);
+	return exit_code;
+}
+
+/*
+ * Resolves real mountpoint path by any path on it
+ * (path should be visible - no overmountes)
+ */
+char *resolve_mountpoint(char *path)
+{
+	char *mp_path, *free_path;
+	bool is_mountpoint;
+
+	/*
+	 * The dirname() function may modify the contents of given path,
+	 * so we need a strdup here to preserve path.
+	 */
+	mp_path = free_path = xstrdup(path);
+	if (!mp_path)
+		return NULL;
+
+	while (1) {
+		/*
+		 * If we see "/" or "." we can't check if they are mountpoints
+		 * by openat2 RESOLVE_NO_XDEV, let's just assume they are.
+		 */
+		if (is_same_path(mp_path, "/"))
+			goto out;
+
+		if (path_is_mountpoint(mp_path, &is_mountpoint) == -1) {
+			xfree(free_path);
+			return NULL;
+		}
+
+		if (is_mountpoint)
+			goto out;
+
+		/* Try parent directory */
+		mp_path = dirname(mp_path);
+	}
+
+	/* never get here */
+	xfree(free_path);
+	return NULL;
+out:
+	/*
+	 * The dirname() function may or may not return statically allocated
+	 * strings, so here mp_path can be either dynamically allocated or
+	 * statically allocated. Let's strdup to make the return pointer
+	 * always freeable.
+	 */
+	mp_path = xstrdup(mp_path);
+	xfree(free_path);
+	return mp_path;
+}
+
+int set_opts_cap_eff(void)
+{
+	struct __user_cap_header_struct cap_header;
+	struct __user_cap_data_struct cap_data[_LINUX_CAPABILITY_U32S_3];
+	int i;
+
+	cap_header.version = _LINUX_CAPABILITY_VERSION_3;
+	cap_header.pid = getpid();
+
+	if (capget(&cap_header, &cap_data[0]))
+		return -1;
+
+	for (i = 0; i < _LINUX_CAPABILITY_U32S_3; i++)
+		memcpy(&opts.cap_eff[i], &cap_data[i].effective, sizeof(u32));
+
+	return 0;
+}

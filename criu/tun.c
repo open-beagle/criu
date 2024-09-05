@@ -24,6 +24,9 @@
 
 #include "images/tun.pb-c.h"
 
+#undef LOG_PREFIX
+#define LOG_PREFIX "tun: "
+
 #ifndef IFF_PERSIST
 #define IFF_PERSIST 0x0800
 #endif
@@ -33,7 +36,7 @@
 #endif
 
 #ifndef TUNSETQUEUE
-#define TUNSETQUEUE  _IOW('T', 217, int)
+#define TUNSETQUEUE	 _IOW('T', 217, int)
 #define IFF_ATTACH_QUEUE 0x0200
 #define IFF_DETACH_QUEUE 0x0400
 #endif
@@ -52,7 +55,7 @@
 #define TUNGETFILTER _IOR('T', 219, struct sock_fprog)
 #endif
 
-#define TUN_DEV_GEN_PATH	"/dev/net/tun"
+#define TUN_DEV_GEN_PATH "/dev/net/tun"
 
 int check_tun_cr(int no_tun_err)
 {
@@ -74,17 +77,18 @@ int check_tun_cr(int no_tun_err)
 
 int check_tun_netns_cr(bool *result)
 {
-	bool val;
+	bool val = false;
 	int tun;
 
 	tun = open(TUN_DEV_GEN_PATH, O_RDONLY);
 	if (tun < 0) {
 		pr_perror("Unable to create tun");
-		return -1;
+		goto out;
 	}
 	check_has_netns_ioc(tun, &val, "tun");
 	close(tun);
 
+out:
 	if (result)
 		*result = val;
 
@@ -96,6 +100,7 @@ static LIST_HEAD(tun_links);
 struct tun_link {
 	char name[IFNAMSIZ];
 	struct list_head l;
+	unsigned ns_id;
 	union {
 		struct {
 			unsigned flags;
@@ -108,7 +113,7 @@ struct tun_link {
 	};
 };
 
-static int list_tun_link(NetDeviceEntry *nde)
+static int list_tun_link(NetDeviceEntry *nde, unsigned ns_id)
 {
 	struct tun_link *tl;
 
@@ -116,30 +121,31 @@ static int list_tun_link(NetDeviceEntry *nde)
 	if (!tl)
 		return -1;
 
-	strlcpy(tl->name, nde->name, sizeof(tl->name));
+	__strlcpy(tl->name, nde->name, sizeof(tl->name));
 	/*
 	 * Keep tun-flags not only for persistency fixup (see
-	 * commend below), but also for TUNSETIFF -- we must
+	 * comment below), but also for TUNSETIFF -- we must
 	 * open the device with the same flags it should live
 	 * with (i.e. -- with which it was created.
 	 */
 	tl->rst.flags = nde->tun->flags;
+	tl->ns_id = ns_id;
 	list_add_tail(&tl->l, &tun_links);
 	return 0;
 }
 
-static struct tun_link *find_tun_link(char *name)
+static struct tun_link *find_tun_link(char *name, unsigned int ns_id)
 {
 	struct tun_link *tl;
 
-	list_for_each_entry(tl, &tun_links, l)
-		if (!strcmp(tl->name, name))
+	list_for_each_entry(tl, &tun_links, l) {
+		if (!strcmp(tl->name, name) && tl->ns_id == ns_id)
 			return tl;
-
+	}
 	return NULL;
 }
 
-static struct tun_link *__dump_tun_link_fd(int fd, char *name, unsigned flags)
+static struct tun_link *__dump_tun_link_fd(int fd, char *name, unsigned ns_id, unsigned flags)
 {
 	struct tun_link *tl;
 	struct sock_fprog flt;
@@ -147,7 +153,9 @@ static struct tun_link *__dump_tun_link_fd(int fd, char *name, unsigned flags)
 	tl = xmalloc(sizeof(*tl));
 	if (!tl)
 		goto err;
-	strlcpy(tl->name, name, sizeof(tl->name));
+	__strlcpy(tl->name, name, sizeof(tl->name));
+	tl->ns_id = ns_id;
+	INIT_LIST_HEAD(&tl->l);
 
 	if (ioctl(fd, TUNGETVNETHDRSZ, &tl->dmp.vnethdr) < 0) {
 		pr_perror("Can't dump vnethdr size for %s", name);
@@ -189,16 +197,16 @@ err:
 	return NULL;
 }
 
-static struct tun_link *dump_tun_link_fd(int fd, char *name, unsigned flags)
+static struct tun_link *dump_tun_link_fd(int fd, char *name, unsigned ns_id, unsigned flags)
 {
 	struct tun_link *tl;
 
-	tl = find_tun_link(name);
+	tl = find_tun_link(name, ns_id);
 	if (tl)
 		return tl;
 
-	tl = __dump_tun_link_fd(fd, name, flags);
-	if (tl)
+	tl = __dump_tun_link_fd(fd, name, ns_id, flags);
+	if (tl) {
 		/*
 		 * Keep this in list till links dumping code starts.
 		 * We can't let it dump all this stuff itself, since
@@ -209,7 +217,7 @@ static struct tun_link *dump_tun_link_fd(int fd, char *name, unsigned flags)
 		 * will attach to the device and get the needed stuff.
 		 */
 		list_add(&tl->l, &tun_links);
-
+	}
 	return tl;
 }
 
@@ -233,7 +241,7 @@ static int open_tun_dev(char *name, unsigned int idx, unsigned flags)
 	}
 
 	memset(&ifr, 0, sizeof(ifr));
-	strlcpy(ifr.ifr_name, name, sizeof(ifr.ifr_name));
+	__strlcpy(ifr.ifr_name, name, sizeof(ifr.ifr_name));
 	ifr.ifr_flags = flags;
 
 	if (ioctl(fd, TUNSETIFF, &ifr)) {
@@ -248,12 +256,12 @@ err:
 	return -1;
 }
 
-static struct tun_link *get_tun_link_fd(char *name, unsigned flags)
+static struct tun_link *get_tun_link_fd(char *name, unsigned ns_id, unsigned flags)
 {
 	struct tun_link *tl;
 	int fd;
 
-	tl = find_tun_link(name);
+	tl = find_tun_link(name, ns_id);
 	if (tl)
 		return tl;
 
@@ -264,7 +272,7 @@ static struct tun_link *get_tun_link_fd(char *name, unsigned flags)
 	 */
 
 	if (!(flags & IFF_PERSIST)) {
-		pr_err("No fd infor for non persistent tun device %s\n", name);
+		pr_err("No fd info for non persistent tun device %s\n", name);
 		return NULL;
 	}
 
@@ -279,7 +287,7 @@ static struct tun_link *get_tun_link_fd(char *name, unsigned flags)
 	if (fd < 0)
 		return NULL;
 
-	tl = __dump_tun_link_fd(fd, name, flags);
+	tl = __dump_tun_link_fd(fd, name, ns_id, flags);
 	close(fd);
 
 	return tl;
@@ -314,7 +322,7 @@ static int dump_tunfile(int lfd, u32 id, const struct fd_parms *p)
 
 	pr_info("Dumping tun-file %d with id %#x\n", lfd, id);
 
-	tfe.id		= id;
+	tfe.id = id;
 	ret = ioctl(lfd, TUNGETIFF, &ifr);
 	if (ret < 0) {
 		if (errno != EBADFD) {
@@ -335,7 +343,7 @@ static int dump_tunfile(int lfd, u32 id, const struct fd_parms *p)
 			tfe.detached = true;
 		}
 
-		if (dump_tun_link_fd(lfd, tfe.netdev, ifr.ifr_flags) == NULL)
+		if (dump_tun_link_fd(lfd, tfe.netdev, tfe.ns_id, ifr.ifr_flags) == NULL)
 			return -1;
 	}
 
@@ -365,26 +373,27 @@ static int tunfile_open(struct file_desc *d, int *new_fd)
 	struct tun_link *tl;
 
 	ti = container_of(d, struct tunfile_info, d);
-	fd = open_reg_by_id(ti->tfe->id);
-	if (fd < 0)
-		return -1;
 
 	ns_id = ti->tfe->ns_id;
 	if (set_netns(ns_id))
-		goto err;
+		return -1;
+
+	fd = open_reg_by_id(ti->tfe->id);
+	if (fd < 0)
+		return -1;
 
 	if (!ti->tfe->netdev)
 		/* just-opened tun file */
 		goto ok;
 
-	tl = find_tun_link(ti->tfe->netdev);
+	tl = find_tun_link(ti->tfe->netdev, ns_id);
 	if (!tl) {
 		pr_err("No tun device for file %s\n", ti->tfe->netdev);
 		goto err;
 	}
 
 	memset(&ifr, 0, sizeof(ifr));
-	strlcpy(ifr.ifr_name, tl->name, sizeof(ifr.ifr_name));
+	__strlcpy(ifr.ifr_name, tl->name, sizeof(ifr.ifr_name));
 	ifr.ifr_flags = tl->rst.flags;
 
 	if (ioctl(fd, TUNSETIFF, &ifr) < 0) {
@@ -446,36 +455,43 @@ int dump_tun_link(NetDeviceEntry *nde, struct cr_imgset *fds, struct nlattr **in
 	TunLinkEntry tle = TUN_LINK_ENTRY__INIT;
 	char spath[64];
 	char buf[64];
-	int ret = 0;
 	struct tun_link *tl;
 
 	sprintf(spath, "class/net/%s/tun_flags", nde->name);
-	ret |= read_ns_sys_file(spath, buf, sizeof(buf));
+	if (read_ns_sys_file(spath, buf, sizeof(buf)) < 0)
+		return -1;
 	tle.flags = strtol(buf, NULL, 0);
 
 	sprintf(spath, "class/net/%s/owner", nde->name);
-	ret |= read_ns_sys_file(spath, buf, sizeof(buf));
+	if (read_ns_sys_file(spath, buf, sizeof(buf)) < 0)
+		return -1;
 	tle.owner = strtol(buf, NULL, 10);
 
 	sprintf(spath, "class/net/%s/group", nde->name);
-	ret |= read_ns_sys_file(spath, buf, sizeof(buf));
+	if (read_ns_sys_file(spath, buf, sizeof(buf)) < 0)
+		return -1;
 	tle.group = strtol(buf, NULL, 10);
 
-	if (ret < 0)
-		return ret;
-
-	tl = get_tun_link_fd(nde->name, tle.flags);
+	tl = get_tun_link_fd(nde->name, nde->peer_nsid, tle.flags);
 	if (!tl)
-		return ret;
+		return -1;
 
 	tle.vnethdr = tl->dmp.vnethdr;
 	tle.sndbuf = tl->dmp.sndbuf;
+
+	/*
+	 * Function get_tun_link_fd() can return either entry
+	 * from tun_links list or a newly allocated one, need to
+	 * free it only if not in list.
+	 */
+	if (list_empty(&tl->l))
+		xfree(tl);
 
 	nde->tun = &tle;
 	return write_netdev_img(nde, fds, info);
 }
 
-int restore_one_tun(struct net_link *link, int nlsk)
+int restore_one_tun(struct ns_id *ns, struct net_link *link, int nlsk)
 {
 	NetDeviceEntry *nde = link->nde;
 	int fd, ret = -1, aux;
@@ -531,7 +547,7 @@ int restore_one_tun(struct net_link *link, int nlsk)
 		goto out;
 	}
 
-	ret = list_tun_link(nde);
+	ret = list_tun_link(nde, ns->id);
 out:
 	close(fd);
 	return ret;

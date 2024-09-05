@@ -16,105 +16,92 @@
 #define KNOWN_NS_MASK (CLONE_NEWUTS | CLONE_NEWNET | CLONE_NEWIPC)
 
 struct sysctl_userns_req {
-	int			op;
-	unsigned int		ns;
-	size_t			nr_req;
-	struct sysctl_req	*reqs;
+	int op;
+	unsigned int ns;
+	size_t nr_req;
+	struct sysctl_req *reqs;
 };
 
-#define __SYSCTL_OP(__ret, __fd, __req, __type, __nr, __op)		\
-do {									\
-	if (__op == CTL_READ)						\
-		__ret = sysctl_read_##__type(__fd, __req,		\
-					     (__type *)(__req)->arg,	\
-					     __nr);			\
-	else if (__op == CTL_WRITE)					\
-		__ret = sysctl_write_##__type(__fd, __req,		\
-					      (__type *)(__req)->arg,	\
-					      __nr);			\
-	else								\
-		__ret = -1;						\
-} while (0)
+#define __SYSCTL_OP(__ret, __fd, __req, __type, __nr, __op)                                       \
+	do {                                                                                      \
+		if (__op == CTL_READ)                                                             \
+			__ret = sysctl_read_##__type(__fd, __req, (__type *)(__req)->arg, __nr);  \
+		else if (__op == CTL_WRITE)                                                       \
+			__ret = sysctl_write_##__type(__fd, __req, (__type *)(__req)->arg, __nr); \
+		else                                                                              \
+			__ret = -1;                                                               \
+	} while (0)
 
-#define GEN_SYSCTL_READ_FUNC(__type, __conv)				\
-static int sysctl_read_##__type(int fd,					\
-				struct sysctl_req *req,			\
-				__type *arg,				\
-				int nr)					\
-{									\
-	char buf[1024] = {0};						\
-	int i, ret = -1;						\
-	char *p = buf;							\
-									\
-	ret = read(fd, buf, sizeof(buf));				\
-	if (ret < 0) {							\
-		pr_perror("Can't read %s", req->name);			\
-		ret = -1;						\
-		goto err;						\
-	}								\
-									\
-	for (i = 0; i < nr && p < buf + sizeof(buf); p++, i++)		\
-		((__type *)arg)[i] = __conv(p, &p, 10);			\
-									\
-	if (i != nr) {							\
-		pr_err("Not enough params for %s (%d != %d)\n",		\
-			req->name, i, nr);				\
-		goto err;						\
-	}								\
-									\
-	ret = 0;							\
-									\
-err:									\
-	return ret;							\
-}
+#define GEN_SYSCTL_READ_FUNC(__type, __conv)                                                 \
+	static int sysctl_read_##__type(int fd, struct sysctl_req *req, __type *arg, int nr) \
+	{                                                                                    \
+		char buf[1024] = { 0 };                                                      \
+		int i, ret = -1;                                                             \
+		char *p = buf;                                                               \
+                                                                                             \
+		ret = read(fd, buf, sizeof(buf));                                            \
+		if (ret < 0) {                                                               \
+			pr_perror("Can't read %s", req->name);                               \
+			ret = -1;                                                            \
+			goto err;                                                            \
+		}                                                                            \
+                                                                                             \
+		for (i = 0; i < nr && p < buf + sizeof(buf); p++, i++)                       \
+			((__type *)arg)[i] = __conv(p, &p, 10);                              \
+                                                                                             \
+		if (i != nr) {                                                               \
+			pr_err("Not enough params for %s (%d != %d)\n", req->name, i, nr);   \
+			goto err;                                                            \
+		}                                                                            \
+                                                                                             \
+		ret = 0;                                                                     \
+                                                                                             \
+	err:                                                                                 \
+		return ret;                                                                  \
+	}
 
-#define GEN_SYSCTL_WRITE_FUNC(__type, __fmt)				\
-static int sysctl_write_##__type(int fd,				\
-				 struct sysctl_req *req,		\
-				 __type *arg,				\
-				 int nr)				\
-{									\
-	char buf[1024];							\
-	int i, ret = -1;						\
-	int off = 0;							\
-									\
-	for (i = 0; i < nr && off < sizeof(buf) - 1; i++) {		\
-		snprintf(&buf[off], sizeof(buf) - off, __fmt, arg[i]);	\
-		off += strlen(&buf[off]);				\
-	}								\
-									\
-	if (i != nr) {							\
-		pr_err("Not enough space for %s (%d != %d)\n",		\
-			req->name, i, nr);				\
-		goto err;						\
-	}								\
-									\
-	/* trailing spaces in format */					\
-	while (off > 0 && isspace(buf[off - 1]))			\
-		off--;							\
-	buf[off + 0] = '\n';						\
-	ret = write(fd, buf, off + 1);					\
-	if (ret < 0) {							\
-		pr_perror("Can't write %s", req->name);			\
-		ret = -1;						\
-		goto err;						\
-	}								\
-									\
-	ret = 0;							\
-err:									\
-	return ret;							\
-}
+#define GEN_SYSCTL_WRITE_FUNC(__type, __fmt)                                                  \
+	static int sysctl_write_##__type(int fd, struct sysctl_req *req, __type *arg, int nr) \
+	{                                                                                     \
+		char buf[1024];                                                               \
+		int i, ret = -1;                                                              \
+		int off = 0;                                                                  \
+                                                                                              \
+		for (i = 0; i < nr && off < sizeof(buf) - 1; i++) {                           \
+			snprintf(&buf[off], sizeof(buf) - off, __fmt, arg[i]);                \
+			off += strlen(&buf[off]);                                             \
+		}                                                                             \
+                                                                                              \
+		if (i != nr) {                                                                \
+			pr_err("Not enough space for %s (%d != %d)\n", req->name, i, nr);     \
+			goto err;                                                             \
+		}                                                                             \
+                                                                                              \
+		/* trailing spaces in format */                                               \
+		while (off > 0 && isspace(buf[off - 1]))                                      \
+			off--;                                                                \
+		buf[off + 0] = '\n';                                                          \
+		ret = write(fd, buf, off + 1);                                                \
+		if (ret < 0) {                                                                \
+			pr_perror("Can't write %s", req->name);                               \
+			ret = -1;                                                             \
+			goto err;                                                             \
+		}                                                                             \
+                                                                                              \
+		ret = 0;                                                                      \
+	err:                                                                                  \
+		return ret;                                                                   \
+	}
 
 GEN_SYSCTL_READ_FUNC(u32, strtoul);
 GEN_SYSCTL_READ_FUNC(u64, strtoull);
 GEN_SYSCTL_READ_FUNC(s32, strtol);
 
 GEN_SYSCTL_WRITE_FUNC(u32, "%u ");
-GEN_SYSCTL_WRITE_FUNC(u64, "%"PRIu64" ");
+GEN_SYSCTL_WRITE_FUNC(u64, "%" PRIu64 " ");
 GEN_SYSCTL_WRITE_FUNC(s32, "%d ");
 
-static int
-sysctl_write_char(int fd, struct sysctl_req *req, char *arg, int nr)
+static int sysctl_write_char(int fd, struct sysctl_req *req, char *arg, int nr)
 {
 	pr_debug("%s nr %d\n", req->name, nr);
 	if (dprintf(fd, "%s\n", arg) < 0)
@@ -123,19 +110,18 @@ sysctl_write_char(int fd, struct sysctl_req *req, char *arg, int nr)
 	return 0;
 }
 
-static int
-sysctl_read_char(int fd, struct sysctl_req *req, char *arg, int nr)
+static int sysctl_read_char(int fd, struct sysctl_req *req, char *arg, int nr)
 {
 	int ret = -1;
 
 	pr_debug("%s nr %d\n", req->name, nr);
 	ret = read(fd, arg, nr - 1);
 	if (ret < 0) {
-		if (errno != EIO ||  !(req->flags & CTL_FLAGS_READ_EIO_SKIP))
+		if (errno != EIO || !(req->flags & CTL_FLAGS_READ_EIO_SKIP))
 			pr_perror("Can't read %s", req->name);
 		goto err;
 	}
-	arg[ret]='\0';
+	arg[ret] = '\0';
 	ret = 0;
 
 err:
@@ -144,7 +130,7 @@ err:
 
 static int sysctl_userns_arg_size(int type)
 {
-	switch(CTL_TYPE(type)) {
+	switch (CTL_TYPE(type)) {
 	case __CTL_U32A:
 		return sizeof(u32) * CTL_LEN(type);
 	case CTL_U32:
@@ -204,7 +190,7 @@ static int __userns_sysctl_op(void *arg, int proc_fd, pid_t pid)
 	pid_t worker;
 
 	// fix up the pointer
-	req = userns_req->reqs = (struct sysctl_req *) &userns_req[1];
+	req = userns_req->reqs = (struct sysctl_req *)&userns_req[1];
 
 	/* For files in the IPC/UTS namespaces, restoring is more complicated
 	 * than for net. Unprivileged users cannot even open these files, so
@@ -217,6 +203,17 @@ static int __userns_sysctl_op(void *arg, int proc_fd, pid_t pid)
 	 * 2. forks a task
 	 * 3. setns()es to the UTS/IPC namespace of the caller
 	 * 4. write()s to the files and exits
+	 *
+	 * For the IPC namespace, since
+	 * https://github.com/torvalds/linux/commit/5563cabdde, user with
+	 * enough capability can open IPC sysctl files and write to it. Later
+	 * commit https://github.com/torvalds/linux/commit/1f5c135ee5 and
+	 * https://github.com/torvalds/linux/commit/0889f44e28 bind the IPC
+	 * namespace at the open() time so the changed value does not depend
+	 * on the IPC namespace at the write() time. Also, the permission check
+	 * changes a little bit which makes the above approach unusable but we
+	 * can simply use nonuserns version for restoring as IPC sysctl as the
+	 * restored process currently has enough capability.
 	 */
 	dir = open("/proc/sys", O_RDONLY, O_DIRECTORY);
 	if (dir < 0) {
@@ -234,17 +231,17 @@ static int __userns_sysctl_op(void *arg, int proc_fd, pid_t pid)
 
 	memset(fds, -1, sizeof(int) * userns_req->nr_req);
 
-	for (i = 0; i < userns_req->nr_req; i++)  {
+	for (i = 0; i < userns_req->nr_req; i++) {
 		int arg_len = sysctl_userns_arg_size(req->type);
-		int name_len = strlen((char *) &req[1]) + 1;
+		int name_len = strlen((char *)&req[1]) + 1;
 		int total_len = sizeof(*req) + arg_len + name_len;
 		int flags;
 
 		/* fix up the pointers */
-		req->name = (char *) &req[1];
+		req->name = (char *)&req[1];
 		req->arg = req->name + name_len;
 
-		if (((char *) req) + total_len >= ((char *) userns_req) + MAX_UNSFD_MSG_SIZE) {
+		if (((char *)req) + total_len >= ((char *)userns_req) + MAX_UNSFD_MSG_SIZE) {
 			pr_err("bad sysctl req %s, too big: %d\n", req->name, total_len);
 			goto out;
 		}
@@ -268,7 +265,7 @@ static int __userns_sysctl_op(void *arg, int proc_fd, pid_t pid)
 		reqs[i] = req;
 		fds[i] = fd;
 
-		req = (struct sysctl_req *) (((char *) req) + total_len);
+		req = (struct sysctl_req *)(((char *)req) + total_len);
 	}
 
 	/*
@@ -349,9 +346,12 @@ out:
 	return ret;
 }
 
-static int __nonuserns_sysctl_op(struct sysctl_req *req, size_t nr_req, int op)
+/* exit_code = 1 in case nonuserns failed but we want to fallback to userns approach */
+static int __nonuserns_sysctl_op(struct sysctl_req **orig_req, size_t *orig_nr_req, int op)
 {
 	int ret, exit_code = -1;
+	struct sysctl_req *req = *orig_req;
+	size_t nr_req = *orig_nr_req;
 
 	while (nr_req--) {
 		int fd;
@@ -365,6 +365,14 @@ static int __nonuserns_sysctl_op(struct sysctl_req *req, size_t nr_req, int op)
 				req++;
 				continue;
 			}
+			if (errno == EACCES && (req->flags & CTL_FLAGS_IPC_EACCES_SKIP)) {
+				/* The remaining requests are restored using userns approach */
+				*orig_req = req;
+				*orig_nr_req = nr_req + 1;
+				exit_code = 1;
+				goto out;
+			}
+
 			pr_perror("Can't open sysctl %s", req->name);
 			goto out;
 		}
@@ -418,7 +426,16 @@ int sysctl_op(struct sysctl_req *req, size_t nr_req, int op, unsigned int ns)
 	 * so we can do those in process as well.
 	 */
 	if (!ns || ns & CLONE_NEWNET || op == CTL_READ)
-		return __nonuserns_sysctl_op(req, nr_req, op);
+		return __nonuserns_sysctl_op(&req, &nr_req, op);
+
+	/* Try to use nonuserns for restoring IPC sysctl and fallback to
+	 * userns approach when the returned code is 1.
+	 */
+	if (ns & CLONE_NEWIPC && op == CTL_WRITE) {
+		ret = __nonuserns_sysctl_op(&req, &nr_req, op);
+		if (ret <= 0)
+			return ret;
+	}
 
 	/*
 	 * In order to avoid lots of opening of /proc/sys for each struct sysctl_req,
@@ -436,7 +453,7 @@ int sysctl_op(struct sysctl_req *req, size_t nr_req, int op, unsigned int ns)
 	userns_req->op = op;
 	userns_req->nr_req = nr_req;
 	userns_req->ns = ns;
-	userns_req->reqs = (struct sysctl_req *) (&userns_req[1]);
+	userns_req->reqs = (struct sysctl_req *)(&userns_req[1]);
 
 	cur = userns_req->reqs;
 	for (i = 0; i < nr_req; i++) {
@@ -444,7 +461,7 @@ int sysctl_op(struct sysctl_req *req, size_t nr_req, int op, unsigned int ns)
 		int name_len = strlen(req[i].name) + 1;
 		int total_len = sizeof(*cur) + arg_len + name_len;
 
-		if (((char *) cur) + total_len >= ((char *) userns_req) + MAX_UNSFD_MSG_SIZE) {
+		if (((char *)cur) + total_len >= ((char *)userns_req) + MAX_UNSFD_MSG_SIZE) {
 			pr_err("sysctl msg %s too big: %d\n", req[i].name, total_len);
 			return -1;
 		}
@@ -453,13 +470,13 @@ int sysctl_op(struct sysctl_req *req, size_t nr_req, int op, unsigned int ns)
 		cur->type = req[i].type;
 		cur->flags = req[i].flags;
 
-		cur->name = (char *) &cur[1];
+		cur->name = (char *)&cur[1];
 		strcpy(cur->name, req[i].name);
 
 		cur->arg = cur->name + name_len;
 		memcpy(cur->arg, req[i].arg, arg_len);
 
-		cur = (struct sysctl_req *) (((char *) cur) + total_len);
+		cur = (struct sysctl_req *)(((char *)cur) + total_len);
 	}
 
 	fd = open_proc(PROC_SELF, "ns");

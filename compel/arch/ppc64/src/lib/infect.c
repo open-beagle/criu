@@ -11,23 +11,27 @@
 #include "log.h"
 #include "common/bug.h"
 #include "common/page.h"
+#include "common/err.h"
 #include "infect.h"
 #include "infect-priv.h"
 
 #ifndef NT_PPC_TM_SPR
-#define NT_PPC_TM_CGPR  0x108           /* TM checkpointed GPR Registers */
-#define NT_PPC_TM_CFPR  0x109           /* TM checkpointed FPR Registers */
-#define NT_PPC_TM_CVMX  0x10a           /* TM checkpointed VMX Registers */
-#define NT_PPC_TM_CVSX  0x10b           /* TM checkpointed VSX Registers */
-#define NT_PPC_TM_SPR   0x10c           /* TM Special Purpose Registers */
+#define NT_PPC_TM_CGPR 0x108 /* TM checkpointed GPR Registers */
+#define NT_PPC_TM_CFPR 0x109 /* TM checkpointed FPR Registers */
+#define NT_PPC_TM_CVMX 0x10a /* TM checkpointed VMX Registers */
+#define NT_PPC_TM_CVSX 0x10b /* TM checkpointed VSX Registers */
+#define NT_PPC_TM_SPR  0x10c /* TM Special Purpose Registers */
 #endif
+
+unsigned __page_size = 0;
+unsigned __page_shift = 0;
 
 /*
  * Injected syscall instruction
  */
 const uint32_t code_syscall[] = {
-	0x44000002,		/* sc 		*/
-	0x0fe00000		/* twi 31,0,0	*/
+	0x44000002, /* sc 		*/
+	0x0fe00000  /* twi 31,0,0	*/
 };
 
 static inline __always_unused void __check_code_syscall(void)
@@ -40,14 +44,14 @@ static void prep_gp_regs(mcontext_t *dst, user_regs_struct_t *regs)
 {
 	memcpy(dst->gp_regs, regs->gpr, sizeof(regs->gpr));
 
-	dst->gp_regs[PT_NIP]		= regs->nip;
-	dst->gp_regs[PT_MSR]		= regs->msr;
-	dst->gp_regs[PT_ORIG_R3]	= regs->orig_gpr3;
-	dst->gp_regs[PT_CTR]		= regs->ctr;
-	dst->gp_regs[PT_LNK]		= regs->link;
-	dst->gp_regs[PT_XER]		= regs->xer;
-	dst->gp_regs[PT_CCR]		= regs->ccr;
-	dst->gp_regs[PT_TRAP]		= regs->trap;
+	dst->gp_regs[PT_NIP] = regs->nip;
+	dst->gp_regs[PT_MSR] = regs->msr;
+	dst->gp_regs[PT_ORIG_R3] = regs->orig_gpr3;
+	dst->gp_regs[PT_CTR] = regs->ctr;
+	dst->gp_regs[PT_LNK] = regs->link;
+	dst->gp_regs[PT_XER] = regs->xer;
+	dst->gp_regs[PT_CCR] = regs->ccr;
+	dst->gp_regs[PT_TRAP] = regs->trap;
 }
 
 static void put_fpu_regs(mcontext_t *mc, uint64_t *fpregs)
@@ -71,9 +75,7 @@ static void put_vsx_regs(mcontext_t *mc, uint64_t *vsxregs)
 	memcpy((uint64_t *)(mc->v_regs + 1), vsxregs, sizeof(*vsxregs) * NVSXREG);
 }
 
-int sigreturn_prep_regs_plain(struct rt_sigframe *sigframe,
-			      user_regs_struct_t *regs,
-			      user_fpregs_struct_t *fpregs)
+int sigreturn_prep_regs_plain(struct rt_sigframe *sigframe, user_regs_struct_t *regs, user_fpregs_struct_t *fpregs)
 {
 	mcontext_t *dst_tc = &sigframe->uc_transact.uc_mcontext;
 	mcontext_t *dst = &sigframe->uc.uc_mcontext;
@@ -131,14 +133,12 @@ static void update_vregs(mcontext_t *lcontext, mcontext_t *rcontext)
 		uint64_t offset = (uint64_t)(lcontext->v_regs) - (uint64_t)lcontext;
 		lcontext->v_regs = (vrregset_t *)((uint64_t)rcontext + offset);
 
-		pr_debug("Updated v_regs:%llx (rcontext:%llx)\n",
-			 (unsigned long long)lcontext->v_regs,
+		pr_debug("Updated v_regs:%llx (rcontext:%llx)\n", (unsigned long long)lcontext->v_regs,
 			 (unsigned long long)rcontext);
 	}
 }
 
-int sigreturn_prep_fpu_frame_plain(struct rt_sigframe *frame,
-				   struct rt_sigframe *rframe)
+int sigreturn_prep_fpu_frame_plain(struct rt_sigframe *frame, struct rt_sigframe *rframe)
 {
 	uint64_t msr = frame->uc.uc_mcontext.gp_regs[PT_MSR];
 
@@ -152,9 +152,8 @@ int sigreturn_prep_fpu_frame_plain(struct rt_sigframe *frame,
 
 	/* Updating the transactional state address if any */
 	if (frame->uc.uc_link) {
-		update_vregs(&frame->uc_transact.uc_mcontext,
-			     &rframe->uc_transact.uc_mcontext);
-		frame->uc.uc_link =  &rframe->uc_transact;
+		update_vregs(&frame->uc_transact.uc_mcontext, &rframe->uc_transact.uc_mcontext);
+		frame->uc.uc_link = &rframe->uc_transact;
 	}
 
 	return 0;
@@ -211,7 +210,7 @@ static int get_fpu_regs(pid_t pid, user_fpregs_struct_t *fp)
 
 static int get_altivec_regs(pid_t pid, user_fpregs_struct_t *fp)
 {
-	if (ptrace(PTRACE_GETVRREGS, pid, 0, (void*)&fp->vrregs) < 0) {
+	if (ptrace(PTRACE_GETVRREGS, pid, 0, (void *)&fp->vrregs) < 0) {
 		/* PTRACE_GETVRREGS returns EIO if Altivec is not supported.
 		 * This should not happen if msr_vec is set. */
 		if (errno != EIO) {
@@ -219,8 +218,7 @@ static int get_altivec_regs(pid_t pid, user_fpregs_struct_t *fp)
 			return -1;
 		}
 		pr_debug("Altivec not supported\n");
-	}
-	else {
+	} else {
 		pr_debug("Dumping Altivec registers\n");
 		fp->flags |= USER_FPREGS_FL_ALTIVEC;
 	}
@@ -238,7 +236,7 @@ static int get_altivec_regs(pid_t pid, user_fpregs_struct_t *fp)
  */
 static int get_vsx_regs(pid_t pid, user_fpregs_struct_t *fp)
 {
-	if (ptrace(PTRACE_GETVSRREGS, pid, 0, (void*)fp->vsxregs) < 0) {
+	if (ptrace(PTRACE_GETVSRREGS, pid, 0, (void *)fp->vsxregs) < 0) {
 		/*
 		 * EIO is returned in the case PTRACE_GETVRREGS is not
 		 * supported.
@@ -248,8 +246,7 @@ static int get_vsx_regs(pid_t pid, user_fpregs_struct_t *fp)
 			return -1;
 		}
 		pr_debug("VSX register's dump not supported.\n");
-	}
-	else {
+	} else {
 		pr_debug("Dumping VSX registers\n");
 		fp->flags |= USER_FPREGS_FL_VSX;
 	}
@@ -262,22 +259,23 @@ static int get_tm_regs(pid_t pid, user_fpregs_struct_t *fpregs)
 
 	pr_debug("Dumping TM registers\n");
 
-#define TM_REQUIRED	0
-#define TM_OPTIONAL	1
-#define PTRACE_GET_TM(s,n,c,u) do {					\
-	iov.iov_base = &s;						\
-	iov.iov_len = sizeof(s);					\
-	if (ptrace(PTRACE_GETREGSET, pid, c, &iov)) {			\
-		if (!u || errno != EIO) {				\
-			pr_perror("Couldn't get TM "n);			\
-			pr_err("Your kernel seems to not support the "	\
-			       "new TM ptrace API (>= 4.8)\n");		\
-			goto out_free;					\
-		}							\
-		pr_debug("TM "n" not supported.\n");			\
-		iov.iov_base = NULL;					\
-	}								\
-} while(0)
+#define TM_REQUIRED 0
+#define TM_OPTIONAL 1
+#define PTRACE_GET_TM(s, n, c, u)                                              \
+	do {                                                                   \
+		iov.iov_base = &s;                                             \
+		iov.iov_len = sizeof(s);                                       \
+		if (ptrace(PTRACE_GETREGSET, pid, c, &iov)) {                  \
+			if (!u || errno != EIO) {                              \
+				pr_perror("Couldn't get TM " n);               \
+				pr_err("Your kernel seems to not support the " \
+				       "new TM ptrace API (>= 4.8)\n");        \
+				goto out_free;                                 \
+			}                                                      \
+			pr_debug("TM " n " not supported.\n");                 \
+			iov.iov_base = NULL;                                   \
+		}                                                              \
+	} while (0)
 
 	/* Get special registers */
 	PTRACE_GET_TM(fpregs->tm.tm_spr_regs, "SPR", NT_PPC_TM_SPR, TM_REQUIRED);
@@ -303,37 +301,61 @@ static int get_tm_regs(pid_t pid, user_fpregs_struct_t *fpregs)
 	return 0;
 
 out_free:
-	return -1;	/* still failing the checkpoint */
+	return -1; /* still failing the checkpoint */
 }
 
-static int __get_task_regs(pid_t pid, user_regs_struct_t *regs,
-			   user_fpregs_struct_t *fpregs)
+/*
+ * This is inspired by kernel function check_syscall_restart in
+ * arch/powerpc/kernel/signal.c
+ */
+
+#ifndef TRAP
+#define TRAP(r) ((r).trap & ~0xF)
+#endif
+
+static bool trap_is_scv(user_regs_struct_t *regs)
+{
+	return TRAP(*regs) == 0x3000;
+}
+
+static bool trap_is_syscall(user_regs_struct_t *regs)
+{
+	return trap_is_scv(regs) || TRAP(*regs) == 0x0C00;
+}
+
+static void handle_syscall(pid_t pid, user_regs_struct_t *regs)
+{
+	unsigned long ret = regs->gpr[3];
+
+	if (trap_is_scv(regs)) {
+		if (!IS_ERR_VALUE(ret))
+			return;
+		ret = -ret;
+	} else if (!(regs->ccr & 0x10000000)) {
+		return;
+	}
+
+	/* Restart or interrupt the system call */
+	switch (ret) {
+	case ERESTARTNOHAND:
+	case ERESTARTSYS:
+	case ERESTARTNOINTR:
+		regs->gpr[3] = regs->orig_gpr3;
+		regs->nip -= 4;
+		break;
+	case ERESTART_RESTARTBLOCK:
+		pr_warn("Will restore %d with interrupted system call\n", pid);
+		regs->gpr[3] = trap_is_scv(regs) ? -EINTR : EINTR;
+		break;
+	}
+}
+
+static int __get_task_regs(pid_t pid, user_regs_struct_t *regs, user_fpregs_struct_t *fpregs)
 {
 	pr_info("Dumping GP/FPU registers for %d\n", pid);
 
-	/*
-	 * This is inspired by kernel function check_syscall_restart in
-	 * arch/powerpc/kernel/signal.c
-	 */
-#ifndef TRAP
-#define TRAP(r)              ((r).trap & ~0xF)
-#endif
-
-	if (TRAP(*regs) == 0x0C00 && regs->ccr & 0x10000000) {
-		/* Restart the system call */
-		switch (regs->gpr[3]) {
-		case ERESTARTNOHAND:
-		case ERESTARTSYS:
-		case ERESTARTNOINTR:
-			regs->gpr[3] = regs->orig_gpr3;
-			regs->nip -= 4;
-			break;
-		case ERESTART_RESTARTBLOCK:
-			regs->gpr[0] = __NR_restart_syscall;
-			regs->nip -= 4;
-			break;
-		}
-	}
+	if (trap_is_syscall(regs))
+		handle_syscall(pid, regs);
 
 	/* Resetting trap since we are now coming from user space. */
 	regs->trap = 0;
@@ -346,10 +368,8 @@ static int __get_task_regs(pid_t pid, user_regs_struct_t *regs,
 	 * impossible) or suspended (easy to get).
 	 */
 	if (MSR_TM_ACTIVE(regs->msr)) {
-		pr_debug("Task %d has %s TM operation at 0x%lx\n",
-			 pid,
-			 (regs->msr & MSR_TMS) ? "a suspended" : "an active",
-			 regs->nip);
+		pr_debug("Task %d has %s TM operation at 0x%lx\n", pid,
+			 (regs->msr & MSR_TMS) ? "a suspended" : "an active", regs->nip);
 		if (get_tm_regs(pid, fpregs))
 			return -1;
 		fpregs->flags = USER_FPREGS_FL_TM;
@@ -371,26 +391,49 @@ static int __get_task_regs(pid_t pid, user_regs_struct_t *regs,
 	return 0;
 }
 
-int get_task_regs(pid_t pid, user_regs_struct_t *regs, save_regs_t save,
-		  void *arg, __maybe_unused unsigned long flags)
+int compel_get_task_regs(pid_t pid, user_regs_struct_t *regs, user_fpregs_struct_t *ext_regs, save_regs_t save,
+			 void *arg, __maybe_unused unsigned long flags)
 {
-	user_fpregs_struct_t fpregs;
+	user_fpregs_struct_t tmp, *fpregs = ext_regs ? ext_regs : &tmp;
 	int ret;
 
-	ret = __get_task_regs(pid, regs, &fpregs);
+	ret = __get_task_regs(pid, regs, fpregs);
 	if (ret)
 		return ret;
 
-	return save(arg, regs, &fpregs);
+	return save(arg, regs, fpregs);
 }
 
-int compel_syscall(struct parasite_ctl *ctl, int nr, long *ret,
-		unsigned long arg1,
-		unsigned long arg2,
-		unsigned long arg3,
-		unsigned long arg4,
-		unsigned long arg5,
-		unsigned long arg6)
+int compel_set_task_ext_regs(pid_t pid, user_fpregs_struct_t *ext_regs)
+{
+	int ret = 0;
+
+	pr_info("Restoring GP/FPU registers for %d\n", pid);
+
+	/* XXX: should restore TM registers somehow? */
+	if (ext_regs->flags & USER_FPREGS_FL_FP) {
+		if (ptrace(PTRACE_SETFPREGS, pid, 0, (void *)&ext_regs->fpregs) < 0) {
+			pr_perror("Couldn't set floating-point registers");
+			ret = -1;
+		}
+	}
+
+	if (ext_regs->flags & USER_FPREGS_FL_ALTIVEC) {
+		if (ptrace(PTRACE_SETVRREGS, pid, 0, (void *)&ext_regs->vrregs) < 0) {
+			pr_perror("Couldn't set Altivec registers");
+			ret = -1;
+		}
+		if (ptrace(PTRACE_SETVSRREGS, pid, 0, (void *)ext_regs->vsxregs) < 0) {
+			pr_perror("Couldn't set VSX registers");
+			ret = -1;
+		}
+	}
+
+	return ret;
+}
+
+int compel_syscall(struct parasite_ctl *ctl, int nr, long *ret, unsigned long arg1, unsigned long arg2,
+		   unsigned long arg3, unsigned long arg4, unsigned long arg5, unsigned long arg6)
 {
 	user_regs_struct_t regs = ctl->orig.regs;
 	int err;
@@ -403,21 +446,18 @@ int compel_syscall(struct parasite_ctl *ctl, int nr, long *ret,
 	regs.gpr[7] = arg5;
 	regs.gpr[8] = arg6;
 
-	err = compel_execute_syscall(ctl, &regs, (char*)code_syscall);
+	err = compel_execute_syscall(ctl, &regs, (char *)code_syscall);
 
 	*ret = regs.gpr[3];
 	return err;
 }
 
-void *remote_mmap(struct parasite_ctl *ctl,
-		  void *addr, size_t length, int prot,
-		  int flags, int fd, off_t offset)
+void *remote_mmap(struct parasite_ctl *ctl, void *addr, size_t length, int prot, int flags, int fd, off_t offset)
 {
 	long map = 0;
 	int err;
 
-	err = compel_syscall(ctl, __NR_mmap, &map,
-			(unsigned long)addr, length, prot, flags, fd, offset);
+	err = compel_syscall(ctl, __NR_mmap, &map, (unsigned long)addr, length, prot, flags, fd, offset);
 	if (err < 0 || (long)map < 0)
 		map = 0;
 
@@ -427,13 +467,13 @@ void *remote_mmap(struct parasite_ctl *ctl,
 void parasite_setup_regs(unsigned long new_ip, void *stack, user_regs_struct_t *regs)
 {
 	/*
-	 * OpenPOWER ABI requires that r12 is set to the calling function addressi
+	 * OpenPOWER ABI requires that r12 is set to the calling function address
 	 * to compute the TOC pointer.
 	 */
 	regs->gpr[12] = new_ip;
 	regs->nip = new_ip;
 	if (stack)
-		regs->gpr[1] = (unsigned long) stack;
+		regs->gpr[1] = (unsigned long)stack - STACK_FRAME_MIN_SIZE;
 	regs->trap = 0;
 }
 
@@ -450,9 +490,7 @@ int arch_fetch_sas(struct parasite_ctl *ctl, struct rt_sigframe *s)
 	long ret;
 	int err;
 
-	err = compel_syscall(ctl, __NR_sigaltstack,
-			     &ret, 0, (unsigned long)&s->uc.uc_stack,
-			     0, 0, 0, 0);
+	err = compel_syscall(ctl, __NR_sigaltstack, &ret, 0, (unsigned long)&s->uc.uc_stack, 0, 0, 0, 0);
 	return err ? err : ret;
 }
 
@@ -461,7 +499,7 @@ int arch_fetch_sas(struct parasite_ctl *ctl, struct rt_sigframe *s)
  *
  * NOTE: 32bit tasks are not supported.
  */
-#define TASK_SIZE_64TB  (0x0000400000000000UL)
+#define TASK_SIZE_64TB	(0x0000400000000000UL)
 #define TASK_SIZE_512TB (0x0002000000000000UL)
 
 #define TASK_SIZE_MIN TASK_SIZE_64TB

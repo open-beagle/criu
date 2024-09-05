@@ -4,9 +4,9 @@
 #include <sys/file.h>
 
 #ifndef F_OFD_GETLK
-#define F_OFD_GETLK	36
-#define F_OFD_SETLK	37
-#define F_OFD_SETLKW	38
+#define F_OFD_GETLK  36
+#define F_OFD_SETLK  37
+#define F_OFD_SETLKW 38
 #endif
 
 /*
@@ -14,7 +14,8 @@
  * from procfs and checking them after restoring.
  */
 
-extern int check_lock_exists(const char *filename, struct flock64 *lck);
-extern int check_file_lock_restored(int pid, int fd, struct flock64 *lck);
+extern int check_lock_exists(const char *filename, struct flock *lck);
+extern int check_file_lock_restored(int pid, int fd, struct flock *lck);
+extern int zdtm_fcntl(int fd, int cmd, struct flock *f);
 
 #endif /* ZDTM_OFD_FILE_LOCKS_H_ */

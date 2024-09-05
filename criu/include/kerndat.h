@@ -5,9 +5,9 @@
 #include "int.h"
 #include "common/config.h"
 #include "asm/kerndat.h"
-#ifdef CONFIG_VDSO
 #include "util-vdso.h"
-#endif
+#include "hugetlb.h"
+#include <compel/ptrace.h>
 
 struct stat;
 
@@ -17,15 +17,11 @@ struct stat;
  */
 
 extern int kerndat_init(void);
-extern int kerndat_get_dirty_track(void);
-extern int kerndat_fdinfo_has_lock(void);
-extern int kerndat_loginuid(void);
-extern int kerndat_files_stat(bool early);
 
 enum pagemap_func {
 	PM_UNKNOWN,
-	PM_DISABLED,	/* /proc/pid/pagemap doesn't open (user mode) */
-	PM_FLAGS_ONLY,	/* pagemap zeroes pfn part (user mode) */
+	PM_DISABLED,   /* /proc/pid/pagemap doesn't open (user mode) */
+	PM_FLAGS_ONLY, /* pagemap zeroes pfn part (user mode) */
 	PM_FULL,
 };
 
@@ -42,6 +38,7 @@ struct kerndat_s {
 	u64 zero_page_pfn;
 	bool has_dirty_track;
 	bool has_memfd;
+	bool has_memfd_hugetlb;
 	bool has_fdinfo_lock;
 	unsigned long task_size;
 	bool ipv6;
@@ -56,23 +53,39 @@ struct kerndat_s {
 	bool has_tcp_half_closed;
 	bool stack_guard_gap_hidden;
 	int lsm;
+	bool apparmor_ns_dumping_enabled;
 	bool has_uffd;
 	unsigned long uffd_features;
 	bool has_thp_disable;
 	bool can_map_vdso;
 	bool vdso_hint_reliable;
-#ifdef CONFIG_VDSO
-	struct vdso_symtable	vdso_sym;
+	struct vdso_symtable vdso_sym;
 #ifdef CONFIG_COMPAT
-	struct vdso_symtable	vdso_sym_compat;
-#endif
+	struct vdso_symtable vdso_sym_compat;
 #endif
 	bool has_nsid;
 	bool has_link_nsid;
 	unsigned int sysctl_nr_open;
-	unsigned long files_stat_max_files;
 	bool x86_has_ptrace_fpu_xsave_bug;
 	bool has_inotify_setnextwd;
+	bool has_kcmp_epoll_tfd;
+	bool has_fsopen;
+	bool has_clone3_set_tid;
+	bool has_timens;
+	bool has_newifindex;
+	bool has_pidfd_open;
+	bool has_pidfd_getfd;
+	bool has_nspid;
+	bool has_nftables_concat;
+	bool has_sockopt_buf_lock;
+	dev_t hugetlb_dev[HUGETLB_MAX];
+	bool has_move_mount_set_group;
+	bool has_openat2;
+	bool has_rseq;
+	bool has_ptrace_get_rseq_conf;
+	struct __ptrace_rseq_configuration libc_rseq_conf;
+	bool has_ipv6_freebind;
+	bool has_membarrier_get_registrations;
 };
 
 extern struct kerndat_s kdat;
@@ -93,7 +106,6 @@ enum {
  */
 extern int kerndat_fs_virtualized(unsigned int which, u32 kdev);
 
-extern int kerndat_tcp_repair();
-extern int kerndat_uffd(void);
+extern int kerndat_has_nspid(void);
 
 #endif /* __CR_KERNDAT_H__ */

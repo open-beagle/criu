@@ -11,8 +11,8 @@
 
 #include "zdtmtst.h"
 
-const char *test_doc	= "Check mounts of external devices";
-const char *test_author	= "Andrei Vagin <avagin@virtuozzo.com";
+const char *test_doc = "Check mounts of external devices";
+const char *test_author = "Andrei Vagin <avagin@virtuozzo.com";
 
 char *dirname;
 TEST_OPTION(dirname, string, "directory name", 1);
@@ -20,9 +20,10 @@ TEST_OPTION(dirname, string, "directory name", 1);
 int main(int argc, char **argv)
 {
 	char *loop, fd, dfd, fd2;
-	test_init(argc, argv);
 	struct stat st, stp, st2;
 	char dname[PATH_MAX], dname2[PATH_MAX];
+
+	test_init(argc, argv);
 
 	snprintf(dname, sizeof(dname), "%s/test_dir", dirname);
 	snprintf(dname2, sizeof(dname2), "%s/test_dir2", dirname);

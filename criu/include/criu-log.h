@@ -21,6 +21,7 @@
 #define __CRIU_LOG_H__
 
 #include "log.h"
+#include <sys/types.h>
 
 extern int log_init(const char *output);
 extern void log_fini(void);
@@ -34,6 +35,7 @@ extern int log_get_fd(void);
 
 extern void log_set_loglevel(unsigned int loglevel);
 extern unsigned int log_get_loglevel(void);
+struct timeval;
 extern void log_get_logstart(struct timeval *);
 
 extern int write_pidfile(int pid);

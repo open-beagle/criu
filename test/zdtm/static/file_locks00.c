@@ -10,8 +10,8 @@
 
 #include "zdtmtst.h"
 
-const char *test_doc	= "Check that posix flocks are restored";
-const char *test_author	= "Qiang Huang <h.huangqiang@huawei.com>";
+const char *test_doc = "Check that posix flocks are restored";
+const char *test_author = "Qiang Huang <h.huangqiang@huawei.com>";
 
 char *filename;
 TEST_OPTION(filename, string, "file name", 1);
@@ -19,38 +19,35 @@ TEST_OPTION(filename, string, "file name", 1);
 char file0[PATH_MAX];
 char file1[PATH_MAX];
 
-static int lock_reg(int fd, int cmd, int type, int whence,
-		off_t offset, off_t len)
+static int lock_reg(int fd, int cmd, int type, int whence, off_t offset, off_t len)
 {
-	struct flock64 lock;
+	struct flock lock;
 
-	lock.l_type   = type;     /* F_RDLCK, F_WRLCK, F_UNLCK */
-	lock.l_whence = whence;   /* SEEK_SET, SEEK_CUR, SEEK_END */
-	lock.l_start  = offset;   /* byte offset, relative to l_whence */
-	lock.l_len    = len;      /* #bytes (0 means to EOF) */
+	lock.l_type = type;	/* F_RDLCK, F_WRLCK, F_UNLCK */
+	lock.l_whence = whence; /* SEEK_SET, SEEK_CUR, SEEK_END */
+	lock.l_start = offset;	/* byte offset, relative to l_whence */
+	lock.l_len = len;	/* #bytes (0 means to EOF) */
 
 	errno = 0;
 	return fcntl(fd, cmd, &lock);
 }
 
-#define set_read_lock(fd, whence, offset, len) \
-	lock_reg(fd, F_SETLK64, F_RDLCK, whence, offset, len)
-#define set_write_lock(fd, whence, offset, len) \
-	lock_reg(fd, F_SETLK64, F_WRLCK, whence, offset, len)
+#define set_read_lock(fd, whence, offset, len)	lock_reg(fd, F_SETLK, F_RDLCK, whence, offset, len)
+#define set_write_lock(fd, whence, offset, len) lock_reg(fd, F_SETLK, F_WRLCK, whence, offset, len)
 
 static int check_read_lock(int fd, int whence, off_t offset, off_t len)
 {
-	struct flock64 lock;
+	struct flock lock;
 	int ret;
 
-	lock.l_type   = F_RDLCK;  /* F_RDLCK, F_WRLCK, F_UNLCK */
-	lock.l_whence = whence;   /* SEEK_SET, SEEK_CUR, SEEK_END */
-	lock.l_start  = offset;   /* byte offset, relative to l_whence */
-	lock.l_len    = len;      /* #bytes (0 means to EOF) */
-	lock.l_pid    = -1;
+	lock.l_type = F_RDLCK;	/* F_RDLCK, F_WRLCK, F_UNLCK */
+	lock.l_whence = whence; /* SEEK_SET, SEEK_CUR, SEEK_END */
+	lock.l_start = offset;	/* byte offset, relative to l_whence */
+	lock.l_len = len;	/* #bytes (0 means to EOF) */
+	lock.l_pid = -1;
 
 	errno = 0;
-	ret = fcntl(fd, F_GETLK64, &lock);
+	ret = fcntl(fd, F_GETLK, &lock);
 	if (ret == -1) {
 		pr_perror("F_GETLK failed.");
 		return -1;
@@ -67,19 +64,19 @@ static int check_read_lock(int fd, int whence, off_t offset, off_t len)
 
 static int check_write_lock(int fd, int whence, off_t offset, off_t len)
 {
-	struct flock64 lock;
+	struct flock lock;
 
 	int ret;
 	pid_t ppid = getppid();
 
-	lock.l_type   = F_WRLCK;  /* F_RDLCK, F_WRLCK, F_UNLCK */
-	lock.l_whence = whence;   /* SEEK_SET, SEEK_CUR, SEEK_END */
-	lock.l_start  = offset;   /* byte offset, relative to l_whence */
-	lock.l_len    = len;      /* #bytes (0 means to EOF) */
-	lock.l_pid    = -1;
+	lock.l_type = F_WRLCK;	/* F_RDLCK, F_WRLCK, F_UNLCK */
+	lock.l_whence = whence; /* SEEK_SET, SEEK_CUR, SEEK_END */
+	lock.l_start = offset;	/* byte offset, relative to l_whence */
+	lock.l_len = len;	/* #bytes (0 means to EOF) */
+	lock.l_pid = -1;
 
 	errno = 0;
-	ret = fcntl(fd, F_GETLK64, &lock);
+	ret = fcntl(fd, F_GETLK, &lock);
 	if (ret == -1) {
 		pr_perror("F_GETLK failed.");
 		return -1;
@@ -101,7 +98,7 @@ static int check_write_lock(int fd, int whence, off_t offset, off_t len)
 	return -1;
 }
 
-static int check_file_locks()
+static int check_file_locks(void)
 {
 	int fd_0, fd_1;
 	int ret0, ret1;
@@ -157,7 +154,7 @@ int main(int argc, char **argv)
 		return -1;
 	}
 
-	if (pid == 0) {	/* child will check father's file locks */
+	if (pid == 0) { /* child will check father's file locks */
 		test_waitsig();
 
 		if (check_file_locks()) {

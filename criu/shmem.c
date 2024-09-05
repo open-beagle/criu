@@ -11,6 +11,7 @@
 #include "image.h"
 #include "cr_options.h"
 #include "kerndat.h"
+#include "stats.h"
 #include "page-pipe.h"
 #include "page-xfer.h"
 #include "rst-malloc.h"
@@ -22,12 +23,14 @@
 #include "types.h"
 #include "page.h"
 #include "util.h"
+#include "memfd.h"
 #include "protobuf.h"
 #include "images/pagemap.pb-c.h"
+#include "namespaces.h"
 
 #ifndef SEEK_DATA
-#define SEEK_DATA	3
-#define SEEK_HOLE	4
+#define SEEK_DATA 3
+#define SEEK_HOLE 4
 #endif
 
 /*
@@ -39,23 +42,23 @@
  * any tasks. Thus the heads are private (COW-ed) and the
  * entries are all in shmem.
  */
-#define SHMEM_HASH_SIZE	32
+#define SHMEM_HASH_SIZE 32
 static struct hlist_head shmems_hash[SHMEM_HASH_SIZE];
 
-#define for_each_shmem(_i, _si)				\
-	for (i = 0; i < SHMEM_HASH_SIZE; i++)			\
+#define for_each_shmem(_i, _si)                  \
+	for (_i = 0; _i < SHMEM_HASH_SIZE; _i++) \
 		hlist_for_each_entry(_si, &shmems_hash[_i], h)
 
 struct shmem_info {
 	struct hlist_node h;
-	unsigned long	shmid;
+	unsigned long shmid;
 
 	/*
 	 * Owner PID. This guy creates anon shmem on restore and
 	 * from this the shmem is read on dump
 	 */
-	int		pid;
-	unsigned long	size;
+	int pid;
+	unsigned long size;
 
 	union {
 		struct { /* For restore */
@@ -63,7 +66,7 @@ struct shmem_info {
 			 * Descriptor by which this shmem is opened
 			 * by the creator
 			 */
-			int		fd;
+			int fd;
 
 			/*
 			 * 0. lock is initialized to zero
@@ -72,38 +75,39 @@ struct shmem_info {
 			 * 3. the master waits all slaves on lock. After that
 			 *    it can close the descriptor.
 			 */
-			futex_t		lock;
+			futex_t lock;
 
 			/*
 			 * Here is a problem, that we don't know, which process will restore
 			 * an region. Each time when we	found a process with a smaller pid,
 			 * we reset self_count, so we can't have only one counter.
 			 */
-			int		count;		/* the number of regions */
-			int		self_count;	/* the number of regions, which belongs to "pid" */
+			int count;	/* the number of regions */
+			int self_count; /* the number of regions, which belongs to "pid" */
 		};
 
-		struct { /* For sysvipc restore */
+		/* For sysvipc restore */
+		struct {
 			struct list_head att; /* list of shmem_sysv_att-s */
-			int		 want_write;
+			int want_write;
 		};
 
 		struct { /* For dump */
-			unsigned long	start;
-			unsigned long	end;
-			unsigned long	*pstate_map;
+			unsigned long start;
+			unsigned long end;
+			unsigned long *pstate_map;
 		};
 	};
 };
 
 struct shmem_sysv_att {
 	struct list_head l;
-	VmaEntry	*first;
-	unsigned long	prev_end;
+	VmaEntry *first;
+	unsigned long prev_end;
 };
 
 /* This is the "pid that will restore shmem" value for sysv */
-#define SYSVIPC_SHMEM_PID	(-1)
+#define SYSVIPC_SHMEM_PID (-1)
 
 static inline struct hlist_head *shmem_chain(unsigned long shmid)
 {
@@ -132,12 +136,12 @@ static struct shmem_info *shmem_find(unsigned long shmid)
 }
 
 #define PST_DONT_DUMP 0
-#define PST_DUMP 1
-#define PST_ZERO 2
-#define PST_DIRTY 3
+#define PST_DUMP      1
+#define PST_ZERO      2
+#define PST_DIRTY     3
 
-#define PST_BITS 2
-#define PST_BIT0_IX(pfn) ((pfn) * PST_BITS)
+#define PST_BITS	 2
+#define PST_BIT0_IX(pfn) ((pfn)*PST_BITS)
 #define PST_BIT1_IX(pfn) (PST_BIT0_IX(pfn) + 1)
 
 /*
@@ -167,8 +171,7 @@ static unsigned int get_pstate(unsigned long *pstate_map, unsigned long pfn)
 	return (bit1 << 1) | bit0;
 }
 
-static void set_pstate(unsigned long *pstate_map, unsigned long pfn,
-		unsigned int pstate)
+static void set_pstate(unsigned long *pstate_map, unsigned long pfn, unsigned int pstate)
 {
 	if (pstate & 1)
 		set_bit(PST_BIT0_IX(pfn), pstate_map);
@@ -178,11 +181,12 @@ static void set_pstate(unsigned long *pstate_map, unsigned long pfn,
 
 static int expand_shmem(struct shmem_info *si, unsigned long new_size)
 {
-	unsigned long nr_pages, nr_map_items, map_size,
-				nr_new_map_items, new_map_size, old_size;
+	unsigned long nr_pages, nr_map_items, map_size;
+	unsigned long nr_new_map_items, new_map_size, old_size;
 
 	old_size = si->size;
 	si->size = new_size;
+
 	if (!is_shmem_tracking_en())
 		return 0;
 
@@ -196,8 +200,7 @@ static int expand_shmem(struct shmem_info *si, unsigned long new_size)
 
 	BUG_ON(new_map_size < map_size);
 
-	si->pstate_map = xrealloc(si->pstate_map, new_map_size);
-	if (!si->pstate_map)
+	if (xrealloc_safe(&si->pstate_map, new_map_size))
 		return -1;
 	memzero(si->pstate_map + nr_map_items, new_map_size - map_size);
 	return 0;
@@ -233,7 +236,7 @@ int collect_sysv_shmem(unsigned long shmid, unsigned long size)
 	 * Tasks will not modify this object, so don't
 	 * shmalloc() as we do it for anon shared mem
 	 */
-	si = malloc(sizeof(*si));
+	si = xmalloc(sizeof(*si));
 	if (!si)
 		return -1;
 
@@ -256,7 +259,8 @@ int fixup_sysv_shmems(void)
 	struct shmem_info *si;
 	struct shmem_sysv_att *att;
 
-	for_each_shmem(i, si) {
+	for_each_shmem(i, si)
+	{
 		/* It can be anon shmem */
 		if (si->pid != SYSVIPC_SHMEM_PID)
 			continue;
@@ -291,13 +295,12 @@ static int open_shmem_sysv(int pid, struct vma_area *vma)
 
 	si = shmem_find(vme->shmid);
 	if (!si) {
-		pr_err("Can't find sysv shmem for %"PRIx64"\n", vme->shmid);
+		pr_err("Can't find sysv shmem for %" PRIx64 "\n", vme->shmid);
 		return -1;
 	}
 
 	if (si->pid != SYSVIPC_SHMEM_PID) {
-		pr_err("SysV shmem vma 0x%"PRIx64" points to anon vma %lx\n",
-				vme->start, si->shmid);
+		pr_err("SysV shmem vma 0x%" PRIx64 " points to anon vma %lx\n", vme->start, si->shmid);
 		return -1;
 	}
 
@@ -358,7 +361,7 @@ static int open_shmem_sysv(int pid, struct vma_area *vma)
 		ret_fd = SYSV_SHMEM_SKIP_FD;
 	}
 
-	pr_info("Note 0x%"PRIx64"-0x%"PRIx64" as %lx sysvshmem\n", vme->start, vme->end, si->shmid);
+	pr_info("Note 0x%" PRIx64 "-0x%" PRIx64 " as %lx sysvshmem\n", vme->start, vme->end, si->shmid);
 
 	att->prev_end = vme->end;
 	if (!vme->has_fdflags || vme->fdflags == O_RDWR)
@@ -392,7 +395,7 @@ int collect_shmem(int pid, struct vma_area *vma)
 	si = shmem_find(vi->shmid);
 	if (si) {
 		if (si->pid == SYSVIPC_SHMEM_PID) {
-			pr_err("Shmem %"PRIx64" already collected as SYSVIPC\n", vi->shmid);
+			pr_err("Shmem %" PRIx64 " already collected as SYSVIPC\n", vi->shmid);
 			return -1;
 		}
 
@@ -413,7 +416,7 @@ int collect_shmem(int pid, struct vma_area *vma)
 			return 0;
 		}
 
-		si->pid	 = pid;
+		si->pid = pid;
 		si->self_count = 1;
 
 		return 0;
@@ -423,13 +426,12 @@ int collect_shmem(int pid, struct vma_area *vma)
 	if (!si)
 		return -1;
 
-	pr_info("Add new shmem 0x%"PRIx64" (%#016"PRIx64"-%#016"PRIx64")\n",
-				vi->shmid, vi->start, vi->end);
+	pr_info("Add new shmem 0x%" PRIx64 " (%#016" PRIx64 "-%#016" PRIx64 ")\n", vi->shmid, vi->start, vi->end);
 
 	si->shmid = vi->shmid;
-	si->pid	  = pid;
-	si->size  = size;
-	si->fd    = -1;
+	si->pid = pid;
+	si->size = size;
+	si->fd = -1;
 	si->count = 1;
 	si->self_count = 1;
 	futex_init(&si->lock);
@@ -446,8 +448,7 @@ static int shmem_wait_and_open(struct shmem_info *si, VmaEntry *vi)
 	pr_info("Waiting for the %lx shmem to appear\n", si->shmid);
 	futex_wait_while(&si->lock, 0);
 
-	snprintf(path, sizeof(path), "/proc/%d/fd/%d",
-		si->pid, si->fd);
+	snprintf(path, sizeof(path), "/proc/%d/fd/%d", si->pid, si->fd);
 
 	pr_info("Opening shmem [%s] \n", path);
 	ret = open_proc_rw(si->pid, "fd/%d", si->fd);
@@ -489,7 +490,7 @@ static int do_restore_shmem_content(void *addr, unsigned long size, unsigned lon
 	return ret;
 }
 
-static int restore_shmem_content(void *addr, struct shmem_info *si)
+int restore_shmem_content(void *addr, struct shmem_info *si)
 {
 	return do_restore_shmem_content(addr, si->size, si->shmid);
 }
@@ -499,18 +500,64 @@ int restore_sysv_shmem_content(void *addr, unsigned long size, unsigned long shm
 	return do_restore_shmem_content(addr, round_up(size, PAGE_SIZE), shmid);
 }
 
+int restore_memfd_shmem_content(int fd, unsigned long shmid, unsigned long size)
+{
+	void *addr = NULL;
+	int ret = 1;
+
+	if (size == 0)
+		return 0;
+
+	if (ftruncate(fd, size) < 0) {
+		pr_perror("Can't resize shmem 0x%lx size=%ld", shmid, size);
+		goto out;
+	}
+
+	addr = mmap(NULL, size, PROT_WRITE | PROT_READ, MAP_SHARED, fd, 0);
+	if (addr == MAP_FAILED) {
+		pr_perror("Can't mmap shmem 0x%lx size=%ld", shmid, size);
+		goto out;
+	}
+
+	/*
+	 * do_restore_shmem_content needs size to be page aligned.
+	 */
+	if (do_restore_shmem_content(addr, round_up(size, PAGE_SIZE), shmid) < 0) {
+		pr_err("Can't restore shmem content\n");
+		goto out;
+	}
+
+	ret = 0;
+
+out:
+	if (addr)
+		munmap(addr, size);
+	return ret;
+}
+
+struct open_map_file_args {
+	unsigned long addr, size;
+};
+
+static int open_map_file(void *args, int fd, pid_t pid)
+{
+	struct open_map_file_args *vma = args;
+
+	return open_proc_rw(pid, "map_files/%lx-%lx", vma->addr, vma->addr + vma->size);
+}
+
 static int open_shmem(int pid, struct vma_area *vma)
 {
 	VmaEntry *vi = vma->e;
 	struct shmem_info *si;
 	void *addr = MAP_FAILED;
 	int f = -1;
-	int flags;
+	int flags, is_hugetlb, memfd_flag = 0;
 
 	si = shmem_find(vi->shmid);
-	pr_info("Search for %#016"PRIx64" shmem 0x%"PRIx64" %p/%d\n", vi->start, vi->shmid, si, si ? si->pid : -1);
+	pr_info("Search for %#016" PRIx64 " shmem 0x%" PRIx64 " %p/%d\n", vi->start, vi->shmid, si, si ? si->pid : -1);
 	if (!si) {
-		pr_err("Can't find my shmem %#016"PRIx64"\n", vi->start);
+		pr_err("Can't find my shmem %#016" PRIx64 "\n", vi->start);
 		return -1;
 	}
 
@@ -529,9 +576,17 @@ static int open_shmem(int pid, struct vma_area *vma)
 		goto out;
 	}
 
+	is_hugetlb = vi->flags & MAP_HUGETLB;
+
 	flags = MAP_SHARED;
-	if (kdat.has_memfd) {
-		f = syscall(SYS_memfd_create, "", 0);
+	if (is_hugetlb) {
+		int size_flag = vi->flags & MAP_HUGETLB_SIZE_MASK;
+		flags |= MAP_HUGETLB | size_flag;
+		memfd_flag |= MFD_HUGETLB | size_flag;
+	}
+
+	if (kdat.has_memfd && (!is_hugetlb || kdat.has_memfd_hugetlb)) {
+		f = memfd_create("", memfd_flag);
 		if (f < 0) {
 			pr_perror("Unable to create memfd");
 			goto err;
@@ -554,8 +609,7 @@ static int open_shmem(int pid, struct vma_area *vma)
 	 */
 	addr = mmap(NULL, si->size, PROT_WRITE | PROT_READ, flags, f, 0);
 	if (addr == MAP_FAILED) {
-		pr_err("Can't mmap shmid=0x%"PRIx64" size=%ld\n",
-				vi->shmid, si->size);
+		pr_perror("Can't mmap shmid=0x%" PRIx64 " size=%ld", vi->shmid, si->size);
 		goto err;
 	}
 
@@ -565,9 +619,11 @@ static int open_shmem(int pid, struct vma_area *vma)
 	}
 
 	if (f == -1) {
-		f = open_proc_rw(getpid(), "map_files/%lx-%lx",
-				(unsigned long) addr,
-				(unsigned long) addr + si->size);
+		struct open_map_file_args args = {
+			.addr = (unsigned long)addr,
+			.size = si->size,
+		};
+		f = userns_call(open_map_file, UNS_FDOUT, &args, sizeof(args), -1);
 		if (f < 0)
 			goto err;
 	}
@@ -633,9 +689,8 @@ static int dump_pages(struct page_pipe *pp, struct page_xfer *xfer)
 	struct page_pipe_buf *ppb;
 
 	list_for_each_entry(ppb, &pp->bufs, l)
-		if (vmsplice(ppb->p[1], ppb->iov, ppb->nr_segs,
-					SPLICE_F_GIFT | SPLICE_F_NONBLOCK) !=
-				ppb->pages_in * PAGE_SIZE) {
+		if (vmsplice(ppb->p[1], ppb->iov, ppb->nr_segs, SPLICE_F_GIFT | SPLICE_F_NONBLOCK) !=
+		    ppb->pages_in * PAGE_SIZE) {
 			pr_perror("Can't get shmem into page-pipe");
 			return -1;
 		}
@@ -643,13 +698,12 @@ static int dump_pages(struct page_pipe *pp, struct page_xfer *xfer)
 	return page_xfer_dump_pages(xfer, pp);
 }
 
-static int next_data_segment(int fd, unsigned long pfn,
-			unsigned long *next_data_pfn, unsigned long *next_hole_pfn)
+static int next_data_segment(int fd, unsigned long pfn, unsigned long *next_data_pfn, unsigned long *next_hole_pfn)
 {
 	off_t off;
 
 	off = lseek(fd, pfn * PAGE_SIZE, SEEK_DATA);
-	if (off == (off_t) -1) {
+	if (off == (off_t)-1) {
 		if (errno == ENXIO) {
 			*next_data_pfn = ~0UL;
 			*next_hole_pfn = ~0UL;
@@ -661,7 +715,7 @@ static int next_data_segment(int fd, unsigned long pfn,
 	*next_data_pfn = off / PAGE_SIZE;
 
 	off = lseek(fd, off, SEEK_HOLE);
-	if (off == (off_t) -1) {
+	if (off == (off_t)-1) {
 		pr_perror("Unable to lseek(SEEK_HOLE)");
 		return -1;
 	}
@@ -676,6 +730,7 @@ static int do_dump_one_shmem(int fd, void *addr, struct shmem_info *si)
 	struct page_xfer xfer;
 	int err, ret = -1;
 	unsigned long pfn, nrpages, next_data_pnf = 0, next_hole_pfn = 0;
+	unsigned long pages[2] = {};
 
 	nrpages = (si->size + PAGE_SIZE - 1) / PAGE_SIZE;
 
@@ -693,9 +748,9 @@ static int do_dump_one_shmem(int fd, void *addr, struct shmem_info *si)
 		unsigned int pgstate = PST_DIRTY;
 		bool use_mc = true;
 		unsigned long pgaddr;
+		int st = -1;
 
-		if (pfn >= next_hole_pfn &&
-		    next_data_segment(fd, pfn, &next_data_pnf, &next_hole_pfn))
+		if (fd >= 0 && pfn >= next_hole_pfn && next_data_segment(fd, pfn, &next_data_pnf, &next_hole_pfn))
 			goto err_xfer;
 
 		if (si->pstate_map && is_shmem_tracking_en()) {
@@ -711,13 +766,16 @@ static int do_dump_one_shmem(int fd, void *addr, struct shmem_info *si)
 		}
 
 		pgaddr = (unsigned long)addr + pfn * PAGE_SIZE;
-again:
+	again:
 		if (pgstate == PST_ZERO)
 			ret = 0;
-		else if (xfer.parent && page_in_parent(pgstate == PST_DIRTY))
+		else if (xfer.parent && page_in_parent(pgstate == PST_DIRTY)) {
 			ret = page_pipe_add_hole(pp, pgaddr, PP_HOLE_PARENT);
-		else
+			st = 0;
+		} else {
 			ret = page_pipe_add_page(pp, pgaddr, 0);
+			st = 1;
+		}
 
 		if (ret == -EAGAIN) {
 			ret = dump_pages(pp, &xfer);
@@ -727,7 +785,14 @@ again:
 			goto again;
 		} else if (ret)
 			goto err_xfer;
+
+		if (st >= 0)
+			pages[st]++;
 	}
+
+	cnt_add(CNT_SHPAGES_SCANNED, nrpages);
+	cnt_add(CNT_SHPAGES_SKIPPED_PARENT, pages[0]);
+	cnt_add(CNT_SHPAGES_WRITTEN, pages[1]);
 
 	ret = dump_pages(pp, &xfer);
 
@@ -743,25 +808,88 @@ static int dump_one_shmem(struct shmem_info *si)
 {
 	int fd, ret = -1;
 	void *addr;
+	unsigned long cur, remaining;
 
 	pr_info("Dumping shared memory %ld\n", si->shmid);
 
-	fd = open_proc(si->pid, "map_files/%lx-%lx", si->start, si->end);
-	if (fd < 0)
-		goto err;
+	fd = __open_proc(si->pid, EPERM, O_RDONLY, "map_files/%lx-%lx", si->start, si->end);
+	if (fd >= 0) {
+		addr = mmap(NULL, si->size, PROT_READ, MAP_SHARED, fd, 0);
+		if (addr == MAP_FAILED) {
+			pr_perror("Can't map shmem 0x%lx (0x%lx-0x%lx)", si->shmid, si->start, si->end);
+			goto errc;
+		}
+	} else {
+		if (errno != EPERM || !opts.unprivileged) {
+			goto err;
+		}
 
-	addr = mmap(NULL, si->size, PROT_READ, MAP_SHARED, fd, 0);
-	if (addr == MAP_FAILED) {
-		pr_err("Can't map shmem 0x%lx (0x%lx-0x%lx)\n",
-				si->shmid, si->start, si->end);
-		goto errc;
+		pr_debug("Could not access map_files/ link, falling back to /proc/$pid/mem\n");
+
+		fd = open_proc(si->pid, "mem");
+		if (fd < 0) {
+			goto err;
+		}
+
+		addr = mmap(NULL, si->size, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+		if (addr == MAP_FAILED) {
+			pr_perror("Can't map empty space for shmem 0x%lx (0x%lx-0x%lx)", si->shmid, si->start, si->end);
+			goto errc;
+		}
+
+		if (lseek(fd, si->start, SEEK_SET) < 0) {
+			pr_perror("Can't seek virtual memory");
+			goto errc;
+		}
+
+		cur = 0;
+		remaining = si->size;
+		do {
+			ret = read(fd, addr + cur, remaining);
+			if (ret <= 0) {
+				pr_perror("Can't read virtual memory");
+				goto errc;
+			}
+			remaining -= ret;
+			cur += ret;
+		} while (remaining > 0);
+
+		close(fd);
+		fd = -1;
 	}
 
 	ret = do_dump_one_shmem(fd, addr, si);
 
 	munmap(addr, si->size);
 errc:
-	close(fd);
+	if (fd >= 0)
+		close(fd);
+err:
+	return ret;
+}
+
+int dump_one_memfd_shmem(int fd, unsigned long shmid, unsigned long size)
+{
+	int ret = -1;
+	void *addr;
+	struct shmem_info si;
+
+	if (size == 0)
+		return 0;
+
+	memset(&si, 0, sizeof(si));
+	si.shmid = shmid;
+	si.size = size;
+
+	addr = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
+	if (addr == MAP_FAILED) {
+		pr_perror("Can't mmap shmem 0x%lx", shmid);
+		goto err;
+	}
+
+	ret = do_dump_one_shmem(fd, addr, &si);
+
+	munmap(addr, size);
 err:
 	return ret;
 }
@@ -781,8 +909,7 @@ int dump_one_sysv_shmem(void *addr, unsigned long size, unsigned long shmid)
 		si = &det;
 	}
 
-	fd = open_proc(PROC_SELF, "map_files/%lx-%lx",
-			(unsigned long)addr, (unsigned long)addr + si->size);
+	fd = open_proc(PROC_SELF, "map_files/%lx-%lx", (unsigned long)addr, (unsigned long)addr + si->size);
 	if (fd < 0)
 		return -1;
 
@@ -796,7 +923,8 @@ int cr_dump_shmem(void)
 	int ret = 0, i;
 	struct shmem_info *si;
 
-	for_each_shmem(i, si) {
+	for_each_shmem(i, si)
+	{
 		if (si->pid == SYSVIPC_SHMEM_PID)
 			continue;
 		ret = dump_one_shmem(si);

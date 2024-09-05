@@ -12,10 +12,10 @@
 #include "zdtmtst.h"
 
 #define STACK_SIZE (1024 * 1024)
-#define GID_INC 1
-#define UID_INC 1
+#define GID_INC	   1
+#define UID_INC	   1
 
-const char *test_doc    = "Check peercred of a unix socket remains the same";
+const char *test_doc = "Check peercred of a unix socket remains the same";
 const char *test_author = "Kirill Tkhai <ktkhai@virtuozzo.com>";
 
 static int child_func(void *fd_p)
@@ -53,7 +53,7 @@ static int child_func(void *fd_p)
 
 	/* If sks[1] == fd, the below closes it, but we don't care */
 	if (dup2(sks[0], fd) == -1) {
-		pr_perror("Can't dup fd\n");
+		pr_perror("Can't dup fd");
 		return 1;
 	}
 
@@ -67,6 +67,7 @@ int main(int argc, char **argv)
 	socklen_t len;
 	char *stack;
 	pid_t pid;
+	int exit_code = 1;
 
 	test_init(argc, argv);
 
@@ -78,7 +79,7 @@ int main(int argc, char **argv)
 	stack = malloc(2 * STACK_SIZE);
 	if (!stack) {
 		pr_err("malloc\n");
-		return 1;
+		goto out;
 	}
 
 	/* Find unused fd */
@@ -89,18 +90,18 @@ int main(int argc, char **argv)
 
 	if (fd == INT_MAX) {
 		pr_err("INT_MAX happens...\n");
-		return 1;
+		goto out;
 	}
 
-	pid = clone(child_func, stack + STACK_SIZE, CLONE_FILES|SIGCHLD, (void *)(unsigned long)fd);
+	pid = clone(child_func, stack + STACK_SIZE, CLONE_FILES | SIGCHLD, (void *)(unsigned long)fd);
 	if (pid == -1) {
 		pr_perror("clone");
-		return 1;
+		goto out;
 	}
 
 	if (wait(&status) == -1 || status) {
-		pr_perror("wait error: status=%d\n", status);
-		return 1;
+		pr_perror("wait error: status=%d", status);
+		goto out;
 	}
 
 	test_daemon();
@@ -109,15 +110,17 @@ int main(int argc, char **argv)
 	len = sizeof(ucred);
 	if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &ucred, &len) < 0) {
 		fail("Can't getsockopt()");
-		return 1;
+		goto out;
 	}
 
-	if (ucred.pid != pid || ucred.gid != getuid() + UID_INC ||
-			        ucred.gid != getgid() + GID_INC) {
-		fail("Wrong pid, uid or gid\n");
-		return 1;
+	if (ucred.pid != pid || ucred.gid != getuid() + UID_INC || ucred.gid != getgid() + GID_INC) {
+		fail("Wrong pid, uid or gid");
+		goto out;
 	}
 
 	pass();
-	return 0;
+	exit_code = 0;
+out:
+	free(stack);
+	return exit_code;
 }

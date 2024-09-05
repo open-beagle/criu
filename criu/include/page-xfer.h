@@ -9,6 +9,9 @@ struct ps_info {
 
 extern int cr_page_server(bool daemon_mode, bool lazy_dump, int cfd);
 
+/* User buffer for read-mode pre-dump*/
+#define PIPE_MAX_BUFFER_SIZE (PIPE_MAX_SIZE << PAGE_SHIFT)
+
 /*
  * page_xfer -- transfer pages into image file.
  * Two images backends are implemented -- local image file
@@ -48,6 +51,7 @@ struct page_xfer {
 extern int open_page_xfer(struct page_xfer *xfer, int fd_type, unsigned long id);
 struct page_pipe;
 extern int page_xfer_dump_pages(struct page_xfer *, struct page_pipe *);
+extern int page_xfer_predump_pages(int pid, struct page_xfer *, struct page_pipe *);
 extern int connect_to_page_server_to_send(void);
 extern int connect_to_page_server_to_recv(int epfd);
 extern int disconnect_from_page_server(void);
@@ -57,7 +61,7 @@ extern int check_parent_page_xfer(int fd_type, unsigned long id);
 /*
  * The post-copy migration makes it necessary to receive pages from
  * remote dump. The protocol we use for that is quite simple:
- * - lazy-pages sedns request containing PS_IOV_GET(nr_pages, vaddr, pid)
+ * - lazy-pages sends request containing PS_IOV_GET(nr_pages, vaddr, pid)
  * - dump-side page server responds with PS_IOV_ADD(nr_pages, vaddr,
      pid) or PS_IOV_ADD(0, 0, 0) if it failed to locate the required
      pages
@@ -68,7 +72,6 @@ extern int check_parent_page_xfer(int fd_type, unsigned long id);
 extern int request_remote_pages(unsigned long img_id, unsigned long addr, int nr_pages);
 
 typedef int (*ps_async_read_complete)(unsigned long img_id, unsigned long vaddr, int nr_pages, void *);
-extern int page_server_start_read(void *buf, int nr_pages,
-		ps_async_read_complete complete, void *priv, unsigned flags);
+extern int page_server_start_read(void *buf, int nr_pages, ps_async_read_complete complete, void *priv, unsigned flags);
 
 #endif /* __CR_PAGE_XFER__H__ */

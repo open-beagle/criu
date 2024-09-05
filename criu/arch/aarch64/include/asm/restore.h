@@ -5,6 +5,7 @@
 
 #include "images/core.pb-c.h"
 
+/* clang-format off */
 #define JUMP_TO_RESTORER_BLOB(new_sp, restore_task_exec_start,	\
 			      task_args)			\
 	asm volatile(						\
@@ -15,13 +16,13 @@
 			: "r"(new_sp),				\
 			  "r"(restore_task_exec_start),		\
 			  "r"(task_args)			\
-			: "sp", "x0", "memory")
+			: "x0", "memory")
+/* clang-format on */
 
 static inline void core_get_tls(CoreEntry *pcore, tls_t *ptls)
 {
 	*ptls = pcore->ti_aarch64->tls;
 }
-
 
 int restore_fpu(struct rt_sigframe *sigframe, CoreEntry *core);
 

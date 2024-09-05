@@ -46,8 +46,7 @@ static int pipe_data_read(struct cr_img *img, struct pipe_data_rst *r)
 	 * anyway we don't increase memory consumption :)
 	 */
 
-	r->data = mmap(NULL, bytes, PROT_READ | PROT_WRITE,
-			MAP_SHARED | MAP_ANON, 0, 0);
+	r->data = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, 0, 0);
 	if (r->data == MAP_FAILED) {
 		pr_perror("Can't map mem for pipe buffers");
 		return -1;
@@ -56,8 +55,8 @@ static int pipe_data_read(struct cr_img *img, struct pipe_data_rst *r)
 	return read_img_buf(img, r->data, bytes);
 }
 
-int do_collect_pipe_data(struct pipe_data_rst *r, ProtobufCMessage *msg,
-		struct cr_img *img, struct pipe_data_rst **hash)
+int do_collect_pipe_data(struct pipe_data_rst *r, ProtobufCMessage *msg, struct cr_img *img,
+			 struct pipe_data_rst **hash)
 {
 	int aux;
 
@@ -69,8 +68,7 @@ int do_collect_pipe_data(struct pipe_data_rst *r, ProtobufCMessage *msg,
 	aux = r->pde->pipe_id & PIPE_DATA_HASH_MASK;
 	r->next = hash[aux];
 	hash[aux] = r;
-	pr_info("Collected pipe data for %#x (chain %u)\n",
-			r->pde->pipe_id, aux);
+	pr_info("Collected pipe data for %#x (chain %u)\n", r->pde->pipe_id, aux);
 	return 0;
 }
 
@@ -160,22 +158,21 @@ int restore_pipe_data(int img_type, int pfd, u32 id, struct pipe_data_rst **hash
 		return 0;
 	}
 
+	if (pd->pde->has_size) {
+		pr_info("Restoring size %#x for %#x\n", pd->pde->size, pd->pde->pipe_id);
+		ret = fcntl(pfd, F_SETPIPE_SZ, pd->pde->size);
+		if (ret < 0) {
+			pr_perror("Can't restore pipe size");
+			return -1;
+		}
+	}
+
 	if (!pd->pde->bytes)
-		goto out;
+		return 0;
 
 	if (!pd->data) {
 		pr_err("Double data restore occurred on %#x\n", id);
 		return -1;
-	}
-
-	if (pd->pde->has_size) {
-		pr_info("Restoring size %#x for %#x\n",
-				pd->pde->size, pd->pde->pipe_id);
-		ret = fcntl(pfd, F_SETPIPE_SZ, pd->pde->size);
-		if (ret < 0) {
-			pr_perror("Can't restore pipe size");
-			goto err;
-		}
 	}
 
 	iov.iov_base = pd->data;
@@ -185,14 +182,12 @@ int restore_pipe_data(int img_type, int pfd, u32 id, struct pipe_data_rst **hash
 		ret = vmsplice(pfd, &iov, 1, SPLICE_F_GIFT | SPLICE_F_NONBLOCK);
 		if (ret < 0) {
 			pr_perror("%#x: Error splicing data", id);
-			goto err;
+			return -1;
 		}
 
 		if (ret == 0 || ret > iov.iov_len /* sanity */) {
-			pr_err("%#x: Wanted to restore %zu bytes, but got %d\n", id,
-					iov.iov_len, ret);
-			ret = -1;
-			goto err;
+			pr_err("%#x: Wanted to restore %zu bytes, but got %d\n", id, iov.iov_len, ret);
+			return -1;
 		}
 
 		iov.iov_base += ret;
@@ -211,16 +206,13 @@ int restore_pipe_data(int img_type, int pfd, u32 id, struct pipe_data_rst **hash
 
 	munmap(pd->data, pd->pde->bytes);
 	pd->data = NULL;
-out:
-	ret = 0;
-err:
-	return ret;
+	return 0;
 }
 
 static int userns_reopen(void *_arg, int fd, pid_t pid)
 {
 	char path[PSFDS];
-	int ret, flags = *(int*)_arg;
+	int ret, flags = *(int *)_arg;
 
 	sprintf(path, "/proc/self/fd/%d", fd);
 	ret = open(path, flags);
@@ -241,8 +233,7 @@ static int reopen_pipe(int fd, int flags)
 	if (ret < 0) {
 		if (errno == EACCES) {
 			/* It may be an external pipe from an another userns */
-			ret = userns_call(userns_reopen, UNS_FDOUT,
-						&flags, sizeof(flags), fd);
+			ret = userns_call(userns_reopen, UNS_FDOUT, &flags, sizeof(flags), fd);
 		} else
 			pr_perror("Unable to reopen the pipe %s", path);
 	}
@@ -282,9 +273,8 @@ static char *pipe_d_name(struct file_desc *d, char *buf, size_t s)
 	struct pipe_info *pi;
 
 	pi = container_of(d, struct pipe_info, d);
-	if (snprintf(buf, s, "pipe:[%d]", pi->pe->pipe_id) >= s) {
-		pr_err("Not enough room for pipe %d identifier string\n",
-				pi->pe->pipe_id);
+	if (snprintf(buf, s, "pipe:[%u]", pi->pe->pipe_id) >= s) {
+		pr_err("Not enough room for pipe %u identifier string\n", pi->pe->pipe_id);
 		return NULL;
 	}
 
@@ -315,8 +305,7 @@ int open_pipe(struct file_desc *d, int *new_fd)
 		return -1;
 	}
 
-	ret = restore_pipe_data(CR_FD_PIPES_DATA, pfd[1],
-			pi->pe->pipe_id, pd_hash_pipes);
+	ret = restore_pipe_data(CR_FD_PIPES_DATA, pfd[1], pi->pe->pipe_id, pd_hash_pipes);
 	if (ret)
 		return -1;
 
@@ -346,9 +335,9 @@ reopen:
 }
 
 static struct file_desc_ops pipe_desc_ops = {
-	.type		= FD_TYPES__PIPE,
-	.open		= open_pipe,
-	.name		= pipe_d_name,
+	.type = FD_TYPES__PIPE,
+	.open = open_pipe,
+	.name = pipe_d_name,
 };
 
 int collect_one_pipe_ops(void *o, ProtobufCMessage *base, struct file_desc_ops *ops)
@@ -359,8 +348,7 @@ int collect_one_pipe_ops(void *o, ProtobufCMessage *base, struct file_desc_ops *
 
 	pi->create = 0;
 	pi->reopen = 1;
-	pr_info("Collected pipe entry ID %#x PIPE ID %#x\n",
-			pi->pe->id, pi->pe->pipe_id);
+	pr_info("Collected pipe entry ID %#x PIPE ID %#x\n", pi->pe->id, pi->pe->pipe_id);
 
 	if (file_desc_add(&pi->d, pi->pe->id, ops))
 		return -1;
@@ -446,7 +434,7 @@ int dump_one_pipe_data(struct pipe_data_dump *pd, int lfd, const struct fd_parms
 	/* steal_pipe has to be able to fit all data from a target pipe */
 	if (fcntl(steal_pipe[1], F_SETPIPE_SZ, pipe_size) < 0) {
 		pr_perror("Unable to set a pipe size");
-		goto err;
+		goto err_close;
 	}
 
 	bytes = tee(lfd, steal_pipe[1], pipe_size, SPLICE_F_NONBLOCK);
@@ -459,26 +447,23 @@ int dump_one_pipe_data(struct pipe_data_dump *pd, int lfd, const struct fd_parms
 		bytes = 0;
 	}
 
-	pde.pipe_id	= pipe_id(p);
-	pde.bytes	= bytes;
-	pde.has_size	= true;
-	pde.size	= pipe_size;
+	pde.pipe_id = pipe_id(p);
+	pde.bytes = bytes;
+	pde.has_size = true;
+	pde.size = pipe_size;
 
 	if (pb_write_one(img, &pde, PB_PIPE_DATA))
 		goto err_close;
 
-	if (bytes) {
+	while (bytes > 0) {
 		int wrote;
-
 		wrote = splice(steal_pipe[0], NULL, img_raw_fd(img), NULL, bytes, 0);
 		if (wrote < 0) {
 			pr_perror("Can't push pipe data");
 			goto err_close;
-		} else if (wrote != bytes) {
-			pr_err("%#x: Wanted to write %d bytes, but wrote %d\n",
-					pipe_id(p), bytes, wrote);
-			goto err_close;
-		}
+		} else if (wrote == 0)
+			break;
+		bytes -= wrote;
 	}
 
 	ret = 0;
@@ -490,25 +475,26 @@ err:
 	return ret;
 }
 
-static struct pipe_data_dump pd_pipes = { .img_type = CR_FD_PIPES_DATA, };
+static struct pipe_data_dump pd_pipes = {
+	.img_type = CR_FD_PIPES_DATA,
+};
 
 static int dump_one_pipe(int lfd, u32 id, const struct fd_parms *p)
 {
 	FileEntry fe = FILE_ENTRY__INIT;
 	PipeEntry pe = PIPE_ENTRY__INIT;
 
-	pr_info("Dumping pipe %d with id %#x pipe_id %#x\n",
-			lfd, id, pipe_id(p));
+	pr_info("Dumping pipe %d with id %#x pipe_id %#x\n", lfd, id, pipe_id(p));
 
 	if ((p->flags & O_DIRECT) && !is_autofs_pipe(pipe_id(p))) {
 		pr_err("The packetized mode for pipes is not supported yet\n");
 		return -1;
 	}
 
-	pe.id		= id;
-	pe.pipe_id	= pipe_id(p);
-	pe.flags	= p->flags & ~O_DIRECT;
-	pe.fown		= (FownEntry *)&p->fown;
+	pe.id = id;
+	pe.pipe_id = pipe_id(p);
+	pe.flags = p->flags & ~O_DIRECT;
+	pe.fown = (FownEntry *)&p->fown;
 
 	fe.type = FD_TYPES__PIPE;
 	fe.id = pe.id;
@@ -521,6 +507,6 @@ static int dump_one_pipe(int lfd, u32 id, const struct fd_parms *p)
 }
 
 const struct fdtype_ops pipe_dump_ops = {
-	.type		= FD_TYPES__PIPE,
-	.dump		= dump_one_pipe,
+	.type = FD_TYPES__PIPE,
+	.dump = dump_one_pipe,
 };

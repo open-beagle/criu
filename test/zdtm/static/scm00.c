@@ -6,8 +6,8 @@
 
 #include "zdtmtst.h"
 
-const char *test_doc	= "Check that SCM_RIGHTS are preserved";
-const char *test_author	= "Pavel Emelyanov <xemul@virtuozzo.com>";
+const char *test_doc = "Check that SCM_RIGHTS are preserved";
+const char *test_author = "Pavel Emelyanov <xemul@virtuozzo.com>";
 
 static int send_fd(int via, int fd)
 {
@@ -105,6 +105,9 @@ int main(int argc, char **argv)
 	p[1] = p[0];
 	p[0] = -1;
 #endif
+#endif
+#ifdef CLOSE_SENDER_FD
+	close(sk[0]);
 #endif
 
 	test_daemon();

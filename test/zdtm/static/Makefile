@@ -14,6 +14,7 @@ TST_NOFILE	:=				\
 		fpu00				\
 		fpu01				\
 		fpu02				\
+		fpu03				\
 		arm-neon00			\
 		futex				\
 		futex-rl			\
@@ -30,6 +31,7 @@ TST_NOFILE	:=				\
 		socket_listen6			\
 		socket_listen4v6		\
 		socket_udp			\
+		socket_udp-broadcast		\
 		socket_udp-corked		\
 		socket6_udp			\
 		socket_udp_shutdown		\
@@ -43,7 +45,8 @@ TST_NOFILE	:=				\
 		packet_sock			\
 		packet_sock_mmap		\
 		packet_sock_spkt		\
-		sock_filter			\
+		sock_filter00			\
+		sock_filter01			\
 		msgque				\
 		inotify_system			\
 		inotify_system_nodel		\
@@ -56,6 +59,10 @@ TST_NOFILE	:=				\
 		pthread00			\
 		pthread01			\
 		pthread02			\
+		pthread_timers			\
+		pthread_timers_h		\
+		rseq00				\
+		membarrier			\
 		vdso00				\
 		vdso01				\
 		vdso02				\
@@ -63,10 +70,16 @@ TST_NOFILE	:=				\
 		utsname				\
 		pstree				\
 		sockets01			\
+		sockets01-seqpacket		\
 		sockets02			\
+		sockets02-seqpacket		\
 		sockets_spair			\
+		sockets_spair_seqpacket		\
 		socket_queues			\
+		socket_queues_seqpacket		\
+		socket-raw			\
 		socket-tcp			\
+		socket-tcp-listen		\
 		socket-tcp-reseted		\
 		socket-tcp6			\
 		socket-tcp4v6			\
@@ -100,12 +113,21 @@ TST_NOFILE	:=				\
 		socket-tcp4v6-closed		\
 		socket-tcp-close0 		\
 		socket-tcp-close1 		\
+		socket-tcp-close2		\
+		socket-dump-tcp-close 		\
 		socket-tcp-unconn		\
 		socket-tcp6-unconn		\
 		socket-tcp-syn-sent		\
+		socket-tcp-skip-in-flight	\
+		socket-tcp-keepalive		\
+		socket-linger			\
 		sock_opts00			\
 		sock_opts01			\
+		sock_opts02			\
+		sock_ip_opts00			\
+		sock_ip_opts01			\
 		sk-unix-unconn			\
+		sk-unix-unconn-seqpacket	\
 		ipc_namespace			\
 		selfexe00			\
 		sem				\
@@ -113,13 +135,18 @@ TST_NOFILE	:=				\
 		maps02				\
 		maps04				\
 		maps05				\
+		maps09				\
+		maps10				\
 		mlock_setuid			\
 		xids00				\
 		groups				\
 		pdeath_sig			\
 		file_fown			\
+		file_cloexec			\
 		proc-self			\
 		eventfs00			\
+		epoll				\
+		epoll01				\
 		signalfd00			\
 		inotify_irmap			\
 		fanotify00			\
@@ -160,6 +187,8 @@ TST_NOFILE	:=				\
 		stopped01			\
 		stopped02			\
 		stopped12			\
+		stopped03			\
+		stopped04			\
 		rtc				\
 		clean_mntns			\
 		mntns_rw_ro_rw			\
@@ -171,18 +200,23 @@ TST_NOFILE	:=				\
 		scm01				\
 		scm02				\
 		scm03				\
+		scm03-seqpacket			\
 		scm04				\
 		scm05				\
 		scm06				\
+		scm09				\
 		aio00				\
 		aio01				\
 		fd				\
 		fd01				\
 		apparmor				\
+		apparmor_stacking				\
 		seccomp_strict			\
 		seccomp_filter			\
 		seccomp_filter_tsync			\
+		seccomp_filter_threads			\
 		seccomp_filter_inheritance		\
+		seccomp_no_new_privs		\
 		different_creds			\
 		vsx				\
 		bridge				\
@@ -195,23 +229,64 @@ TST_NOFILE	:=				\
 		macvlan			\
 		sit				\
 		cr_veth				\
+		cr_veth02			\
 		sock_peercred			\
 		s390x_mmap_high			\
 		uffd-events			\
 		thread_different_uid_gid	\
 		pipe03				\
+		netns_lock_iptables			\
+		netns_lock_nftables			\
+		net_lock_socket_iptables		\
+		net_lock_socket_iptables6		\
+		net_lock_socket_nftables		\
+		net_lock_socket_nftables6		\
 		netns_sub			\
 		netns_sub_veth			\
+		netns_sub_sysctl	\
 		unlink_multiple_largefiles	\
+		thp_disable			\
+		pid_file			\
+		selinux00			\
+		selinux01			\
+		selinux02			\
+		child_subreaper			\
+		child_subreaper_existing_child	\
+		child_subreaper_and_reparent	\
+		memfd00				\
+		memfd01				\
+		memfd02				\
+		memfd02-hugetlb			\
+		memfd03				\
+		memfd04				\
+		memfd05				\
+		shmemfd				\
+		shmemfd-priv			\
+		time				\
+		timens_nested			\
+		timens_for_kids			\
+		zombie_leader			\
+		sigtrap				\
+		sigtrap01			\
+		change_mnt_context		\
+		fd_offset			\
 #		jobctl00			\
 
-ifneq ($(SRCARCH),arm)
+PKG_CONFIG ?= pkg-config
+pkg-config-check = $(shell sh -c '$(PKG_CONFIG) $(1) && echo y')
+ifeq ($(call pkg-config-check,libbpf),y)
+TST_NOFILE	+=				\
+		bpf_hash			\
+		bpf_array			
+endif
+
+ifneq ($(ARCH),arm)
 ifneq ($(COMPAT_TEST),y)
         TST_NOFILE += maps03
 endif
 endif
 
-ifeq ($(SRCARCH),s390)
+ifeq ($(ARCH),s390)
         TST_NOFILE +=	s390x_regs_check	\
 			s390x_gs_threads	\
 			s390x_runtime_instr
@@ -228,6 +303,7 @@ TST_FILE	=				\
 		file_attr			\
 		deleted_unix_sock		\
 		sk-unix-rel			\
+		sk-unix-rel-seqpacket		\
 		deleted_dev			\
 		unlink_fstat00			\
 		unlink_fstat01			\
@@ -237,6 +313,10 @@ TST_FILE	=				\
 		ghost_holes00			\
 		ghost_holes01			\
 		ghost_holes02			\
+		ghost_holes_large00     \
+		ghost_holes_large01     \
+		ghost_multi_hole00      \
+		ghost_multi_hole01      \
 		unlink_largefile		\
 		mtime_mmap			\
 		fifo				\
@@ -255,7 +335,9 @@ TST_FILE	=				\
 		cow01				\
 		fdt_shared			\
 		sockets00			\
+		sockets00-seqpacket		\
 		sockets03			\
+		sockets03-seqpacket		\
 		sockets_dgram			\
 		file_lease00			\
 		file_lease01			\
@@ -263,6 +345,7 @@ TST_FILE	=				\
 		file_lease03			\
 		file_lease04			\
 		file_locks00			\
+		file_locks00_fail		\
 		file_locks01			\
 		file_locks02			\
 		file_locks03			\
@@ -272,8 +355,16 @@ TST_FILE	=				\
 		file_locks07			\
 		file_locks08			\
 		netns-nf			\
+		netns-nft			\
+		netns-nft-ipt			\
 		maps_file_prot			\
 		socket_close_data01		\
+		fifo_upon_unix_socket00		\
+		fifo_upon_unix_socket01		\
+		sk-unix-listen01		\
+		sk-unix-listen02		\
+		sk-unix-listen03		\
+		sk-unix-listen04		\
 
 TST_DIR		=				\
 		cwd00				\
@@ -297,14 +388,19 @@ TST_DIR		=				\
 		inotify00			\
 		inotify01			\
 		inotify02			\
+		inotify04			\
 		cgroup00			\
 		rmdir_open			\
 		cgroup01			\
 		cgroup02			\
 		cgroup03			\
 		cgroup04			\
+		cgroupv2_00			\
+		cgroupv2_01			\
 		cgroup_ifpriomap		\
-		cgroup_stray		\
+		cgroup_ignore			\
+		cgroup_stray			\
+		cgroup_yard			\
 		unlink_fstat04			\
 		unlink_fstat041			\
 		mntns_remap			\
@@ -325,13 +421,35 @@ TST_DIR		=				\
 		mnt_ext_auto			\
 		mnt_ext_master			\
 		mnt_ext_dev			\
+		mnt_ext_root			\
+		mnt_root_ext			\
+		mnt_ext_collision		\
+		mntns_pivot_root		\
+		mntns_pivot_root_ro		\
+		mnt_ext_sharing			\
+		mnt_ext_multiple		\
+		mount_complex_sharing		\
 		mnt_tracefs			\
 		mntns_deleted			\
 		unlink_regular00		\
 		mnt_enablefs			\
 		autofs				\
 		del_standalone_un		\
+		del_standalone_un_seqpacket	\
 		sk-unix-mntns			\
+		sk-unix01			\
+		sk-unix01-seqpacket		\
+		sk-unix-dgram-ghost		\
+		unsupported_children_collision  \
+		shared_slave_mount_children	\
+		non_uniform_share_propagation	\
+		private_bind_propagation	\
+		ghost_on_rofs			\
+		overmounted_file		\
+		opath_file			\
+		symlink				\
+		symlink01			\
+		unbindable			\
 
 TST_DIR_FILE	=				\
 		chroot				\
@@ -348,6 +466,7 @@ TST		=				\
 		umask00				\
 		cmdlinenv00			\
 		shm-unaligned			\
+		shm-hugetlb			\
 
 TST_STATE	=				\
 		conntracks			\
@@ -386,6 +505,9 @@ cmdlinenv00.pid: cmdlinenv00
 
 shm-unaligned.pid: shm-unaligned
 	$(<D)/$(<F) --pidfile=$@ --outfile=$<.out --shmem_size=5000
+
+shm-hugetlb.pid: shm-hugetlb
+	$(<D)/$(<F) --pidfile=$@ --outfile=$<.out --shmem_size=4194304
 
 env00.pid:	env00
 	$(<D)/$(<F) --pidfile=$@ --outfile=$<.out --envname=ENV_00_TEST
@@ -428,8 +550,8 @@ WAIT_TIME=240
 	[ $$i -lt $(WAIT_TIME) ]
 
 wait_stop:
-		i=0; \
-		while [ $$i -lt $(WAIT_TIME) ] ; do \
+	i=0; \
+	while [ $$i -lt $(WAIT_TIME) ] ; do \
 		kill -0 `awk '{print}' *.pid 2>/dev/null` 2>/dev/null || break; \
 		sleep 1; \
 		i=`expr $$i + 1`; \
@@ -440,6 +562,8 @@ $(TST):	| $(LIB)
 aio00:			LDLIBS += -laio
 different_creds:	LDLIBS += -lcap
 file_locks06 file_locks07 file_locks08:	ofd_file_locks.o
+fpu03:			CFLAGS += -pthread -D ZDTM_FPU00_RUN_IN_THREAD
+fpu03:			LDFLAGS += -pthread
 futex:			CFLAGS += -pthread
 futex:			LDFLAGS += -pthread
 futex-rl:		CFLAGS += -pthread
@@ -449,19 +573,23 @@ socket_listen:		LDLIBS += -lrt -pthread
 socket_aio:		LDLIBS += -lrt -pthread
 uptime_grow:		LDLIBS += -lrt -pthread
 unlink_largefile:	CFLAGS += -D_FILE_OFFSET_BITS=64 -D_LARGEFILE64_SOURCE
-inotify_system_nodel:	CFLAGS += -DNODEL
+inotify_system_nodel:	CFLAGS += -DNO_DEL
 pthread00:		LDLIBS += -pthread
 pthread01:		LDLIBS += -pthread
 pthread02:		LDLIBS += -pthread
+pthread_timers:		LDLIBS += -lrt -pthread
+pthread_timers_h:	LDLIBS += -lrt -pthread
 different_creds:	LDLIBS += -pthread
 sigpending:		LDLIBS += -pthread
 sigaltstack:		LDLIBS += -pthread
 seccomp_filter_tsync:	LDLIBS += -pthread
+seccomp_filter_threads:	LDLIBS += -pthread
 shm:			CFLAGS += -DNEW_IPC_NS
 msgque:			CFLAGS += -DNEW_IPC_NS
 sem:			CFLAGS += -DNEW_IPC_NS
 posix_timers:		LDLIBS += -lrt -pthread
 remap_dead_pid_root:	CFLAGS += -DREMAP_PID_ROOT
+sock_filter01:		CFLAGS += -DSOCK_FILTER01
 socket-tcp6:		CFLAGS += -D ZDTM_IPV6
 socket-tcp4v6:		CFLAGS += -D ZDTM_IPV4V6
 socket-tcpbuf6:		CFLAGS += -D ZDTM_IPV6
@@ -476,33 +604,43 @@ socket_listen4v6:	CFLAGS += -D ZDTM_IPV4V6
 socket-tcp6-closed:	CFLAGS += -D ZDTM_IPV6
 socket-tcp6-closed:	CFLAGS += -D ZDTM_IPV4V6
 socket-tcp-closed-last-ack:	CFLAGS += -D ZDTM_TCP_LAST_ACK
+socket-tcp-skip-in-flight:	CFLAGS += -D ZDTM_IPV4V6
+sock_ip_opts01:		CFLAGS += -DZDTM_VAL_ZERO
 tun_ns:			CFLAGS += -DTUN_NS
 mnt_ext_manual:		CFLAGS += -D ZDTM_EXTMAP_MANUAL
+mntns_pivot_root_ro:	CFLAGS += -DMNTNS_PIVOT_ROOT_RO
 sigpending:		LDLIBS += -lrt
 vdso01:			LDLIBS += -lrt
 scm01:			CFLAGS += -DKEEP_SENT_FD
 scm02:			CFLAGS += -DSEND_BOTH
 scm04:			CFLAGS += -DSEPARATE
+scm09:			CFLAGS += -DCLOSE_SENDER_FD
 mntns_link_remap:	CFLAGS += -DZDTM_LINK_REMAP
 mntns_shared_bind02:	CFLAGS += -DSHARED_BIND02
 mntns_root_bind02:	CFLAGS += -DROOT_BIND02
 maps02: get_smaps_bits.o
 mlock_setuid: get_smaps_bits.o
+thp_disable: get_smaps_bits.o
 inotify01:		CFLAGS += -DINOTIFY01
 unlink_fstat01+:	CFLAGS += -DUNLINK_OVER
 unlink_fstat04:		CFLAGS += -DUNLINK_FSTAT04
 unlink_fstat041:		CFLAGS += -DUNLINK_FSTAT041 -DUNLINK_FSTAT04
 ghost_holes01:		CFLAGS += -DTAIL_HOLE
 ghost_holes02:		CFLAGS += -DHEAD_HOLE
+ghost_holes_large01:		CFLAGS += -DLIMIT
 sk-freebind-false:	CFLAGS += -DZDTM_FREEBIND_FALSE
+selinux02:		CFLAGS += -DUSING_SOCKCREATE
 stopped01:		CFLAGS += -DZDTM_STOPPED_KILL
 stopped02:		CFLAGS += -DZDTM_STOPPED_TKILL
 stopped12:		CFLAGS += -DZDTM_STOPPED_KILL -DZDTM_STOPPED_TKILL
 clone_fs:		LDLIBS += -pthread
 # As generating dependencies won't work without proper includes,
 # we have to explicitly specify both .o and .d for this case:
-netns_sub_veth.o netns_sub_veth.d:	CPPFLAGS += -I/usr/include/libnl3
-netns_sub_veth:		LDLIBS += -lnl-3 -l nl-route-3
+netns_sub_veth.o netns_sub_veth.d: CPPFLAGS += $(call pkg-cflags, libnl-3.0)
+netns_sub_veth:		LDLIBS += $(call pkg-libs, libnl-route-3.0 libnl-3.0)
+net_lock_socket_iptables6:	CFLAGS += -D ZDTM_IPV6
+net_lock_socket_nftables6:	CFLAGS += -D ZDTM_IPV6
+symlink01:		CFLAGS += -DZDTM_UNLINK_SYMLINK
 
 socket-tcp-fin-wait1:	CFLAGS += -D ZDTM_TCP_FIN_WAIT1
 socket-tcp-fin-wait2:	CFLAGS += -D ZDTM_TCP_FIN_WAIT2
@@ -519,15 +657,41 @@ socket-tcp6-closing:	CFLAGS += -D ZDTM_IPV6
 socket-tcp6-unconn:	CFLAGS += -D ZDTM_IPV6
 socket-tcp4v6-last-ack:	CFLAGS += -D ZDTM_TCP_LAST_ACK -D ZDTM_IPV4V6
 socket-tcp4v6-closing:	CFLAGS += -D ZDTM_IPV4V6
+memfd02-hugetlb:	CFLAGS += -D ZDTM_HUGETLB
+memfd05:		CFLAGS += -D ZDTM_MEMFD05
+
+sockets00-seqpacket:	CFLAGS += -D ZDTM_UNIX_SEQPACKET
+sockets01-seqpacket:	CFLAGS += -D ZDTM_UNIX_SEQPACKET
+sockets02-seqpacket:	CFLAGS += -D ZDTM_UNIX_SEQPACKET
+sockets03-seqpacket:	CFLAGS += -D ZDTM_UNIX_SEQPACKET
+sk-unix01-seqpacket:	CFLAGS += -D ZDTM_UNIX_SEQPACKET
+sk-unix-rel-seqpacket:	CFLAGS += -D ZDTM_UNIX_SEQPACKET
+sockets_spair_seqpacket:	CFLAGS += -D ZDTM_UNIX_SEQPACKET
+socket_queues_seqpacket:	CFLAGS += -D ZDTM_UNIX_SEQPACKET
+del_standalone_un_seqpacket:	CFLAGS += -D ZDTM_UNIX_SEQPACKET
+sk-unix-unconn-seqpacket:	CFLAGS += -D ZDTM_UNIX_SEQPACKET
+scm03-seqpacket:	CFLAGS += -D ZDTM_UNIX_SEQPACKET
 
 pty-console:		CFLAGS += -D ZDTM_DEV_CONSOLE
 
 shm-unaligned:		CFLAGS += -DZDTM_SHM_UNALIGNED
+shm-hugetlb:		CFLAGS += -DZDTM_HUGETLB
 
 s390x_regs_check:	LDFLAGS += -pthread
 s390x_gs_threads:	LDFLAGS += -pthread
 
 thread_different_uid_gid:	LDLIBS += -pthread -lcap
+
+bpf_hash:		LDLIBS += -lbpf
+bpf_array:		LDLIBS += -lbpf
+
+fifo_upon_unix_socket01:	CFLAGS += -DFIFO_UPON_UNIX01
+
+sk-unix-listen02: CFLAGS += -DSK_UNIX_LISTEN02
+sk-unix-listen03: CFLAGS += -DSK_UNIX_LISTEN03
+sk-unix-listen04: CFLAGS += -DSK_UNIX_LISTEN02 -DSK_UNIX_LISTEN03
+
+cgroupv2_01:		LDLIBS += -pthread
 
 $(LIB):	force
 	$(Q) $(MAKE) -C $(LIBDIR)

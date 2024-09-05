@@ -15,9 +15,13 @@
 #include <signal.h>
 #include <sched.h>
 #include <sys/socket.h>
+#include <time.h>
+#include <sys/prctl.h>
 
 #include "zdtmtst.h"
 #include "ns.h"
+
+int criu_status_in = -1, criu_status_in_peer = -1, criu_status_out = -1;
 
 extern int pivot_root(const char *new_root, const char *put_old);
 static int prepare_mntns(void)
@@ -37,7 +41,7 @@ static int prepare_mntns(void)
 	 * under them. So we need to create another mount for the
 	 * new root.
 	 */
-	if (mount(root, root, NULL, MS_SLAVE , NULL)) {
+	if (mount(root, root, NULL, MS_SLAVE, NULL)) {
 		fprintf(stderr, "Can't bind-mount root: %m\n");
 		return -1;
 	}
@@ -50,8 +54,7 @@ static int prepare_mntns(void)
 	criu_path = getenv("ZDTM_CRIU");
 	if (criu_path) {
 		snprintf(path, sizeof(path), "%s%s", root, criu_path);
-		if (mount(criu_path, path, NULL, MS_BIND, NULL) ||
-		    mount(NULL, path, NULL, MS_PRIVATE, NULL)) {
+		if (mount(criu_path, path, NULL, MS_BIND, NULL) || mount(NULL, path, NULL, MS_PRIVATE, NULL)) {
 			pr_perror("Unable to mount %s", path);
 			return -1;
 		}
@@ -83,7 +86,7 @@ static int prepare_mntns(void)
 		return -1;
 	}
 
-	if (mount("./old", "./old", NULL, MS_SLAVE | MS_REC , NULL)) {
+	if (mount("./old", "./old", NULL, MS_SLAVE | MS_REC, NULL)) {
 		fprintf(stderr, "Can't bind-mount root: %m\n");
 		return -1;
 	}
@@ -155,7 +158,7 @@ static int prepare_namespaces(void)
 	return 0;
 }
 
-#define NS_STACK_SIZE	4096
+#define NS_STACK_SIZE 4096
 
 /* All arguments should be above stack, because it grows down */
 struct ns_exec_args {
@@ -187,13 +190,11 @@ static void ns_sig_hand(int signo)
 				if (futex_get(&sig_received))
 					return;
 				futex_set_and_wake(&sig_received, signo);
-				len = snprintf(buf, sizeof(buf),
-						"All test processes exited\n");
+				len = snprintf(buf, sizeof(buf), "All test processes exited\n");
 			} else {
-				len = snprintf(buf, sizeof(buf),
-						"wait() failed: %m\n");
+				len = snprintf(buf, sizeof(buf), "wait() failed: %m\n");
 			}
-				goto write_out;
+			goto write_out;
 		}
 		if (status)
 			fprintf(stderr, "%d return %d\n", pid, status);
@@ -205,10 +206,43 @@ write_out:
 	write(STDERR_FILENO, buf, MIN(len, sizeof(buf)));
 }
 
+#ifndef CLONE_NEWTIME
+#define CLONE_NEWTIME 0x00000080 /* New time namespace */
+#endif
+
+static inline int _settime(clockid_t clk_id, time_t offset)
+{
+	int fd, len;
+	char buf[4096];
+
+	if (clk_id == CLOCK_MONOTONIC_COARSE || clk_id == CLOCK_MONOTONIC_RAW)
+		clk_id = CLOCK_MONOTONIC;
+
+	len = snprintf(buf, sizeof(buf), "%d %ld 0", clk_id, offset);
+
+	fd = open("/proc/self/timens_offsets", O_WRONLY);
+	if (fd < 0) {
+		fprintf(stderr, "open(/proc/self/timens_offsets): %m");
+		return -1;
+	}
+
+	if (write(fd, buf, len) != len) {
+		fprintf(stderr, "write(/proc/self/timens_offsets): %m");
+		return -1;
+	}
+
+	if (close(fd)) {
+		fprintf(stderr, "close(/proc/self/timens_offsets): %m");
+		return -1;
+	}
+
+	return 0;
+}
+
 #define STATUS_FD 255
 static int ns_exec(void *_arg)
 {
-	struct ns_exec_args *args = (struct ns_exec_args *) _arg;
+	struct ns_exec_args *args = (struct ns_exec_args *)_arg;
 	char buf[4096];
 	int ret;
 
@@ -216,6 +250,7 @@ static int ns_exec(void *_arg)
 
 	setsid();
 
+	prctl(PR_SET_DUMPABLE, 1, 0, 0, 0);
 	ret = dup2(args->status_pipe[1], STATUS_FD);
 	if (ret < 0) {
 		fprintf(stderr, "dup2() failed: %m\n");
@@ -234,11 +269,40 @@ static int ns_exec(void *_arg)
 	return -1;
 }
 
+static int create_timens(void)
+{
+	int fd;
+
+	if (unshare(CLONE_NEWTIME)) {
+		if (errno == EINVAL) {
+			fprintf(stderr, "timens isn't supported\n");
+			return 0;
+		} else {
+			fprintf(stderr, "unshare(CLONE_NEWTIME) failed: %m");
+			exit(1);
+		}
+	}
+
+	if (_settime(CLOCK_MONOTONIC, 10 * 24 * 60 * 60))
+		exit(1);
+	if (_settime(CLOCK_BOOTTIME, 20 * 24 * 60 * 60))
+		exit(1);
+
+	fd = open("/proc/self/ns/time_for_children", O_RDONLY);
+	if (fd < 0)
+		exit(1);
+	if (setns(fd, 0))
+		exit(1);
+	close(fd);
+
+	return 0;
+}
+
 int ns_init(int argc, char **argv)
 {
 	struct sigaction sa = {
-		.sa_handler	= ns_sig_hand,
-		.sa_flags	= SA_RESTART,
+		.sa_handler = ns_sig_hand,
+		.sa_flags = SA_RESTART,
 	};
 	int ret, fd, status_pipe = STATUS_FD;
 	char buf[128], *x;
@@ -248,6 +312,14 @@ int ns_init(int argc, char **argv)
 	ret = fcntl(status_pipe, F_SETFD, FD_CLOEXEC);
 	if (ret == -1) {
 		fprintf(stderr, "fcntl failed %m\n");
+		exit(1);
+	}
+
+	if (create_timens())
+		exit(1);
+
+	if (init_notify()) {
+		fprintf(stderr, "Can't init pre-dump notification: %m");
 		exit(1);
 	}
 
@@ -297,7 +369,7 @@ int ns_init(int argc, char **argv)
 			break;
 		if (pid < 0) {
 			fprintf(stderr, "waitpid() failed: %m\n");
-			exit (1);
+			exit(1);
 		}
 		if (status)
 			fprintf(stderr, "%d return %d\n", pid, status);
@@ -318,11 +390,11 @@ int ns_init(int argc, char **argv)
 		exit(1);
 	}
 	ret = read(fd, buf, sizeof(buf) - 1);
-	buf[ret] = '\0';
 	if (ret == -1) {
 		fprintf(stderr, "read() failed: %m\n");
 		exit(1);
 	}
+	buf[ret] = '\0';
 
 	pid = atoi(buf);
 	fprintf(stderr, "kill(%d, SIGTERM)\n", pid);
@@ -351,7 +423,6 @@ int ns_init(int argc, char **argv)
 		waitpid(pid, NULL, 0);
 	}
 
-
 	exit(1);
 }
 
@@ -374,8 +445,7 @@ void ns_create(int argc, char **argv)
 		exit(1);
 	}
 
-	flags = CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWUTS |
-		CLONE_NEWNET | CLONE_NEWIPC | SIGCHLD;
+	flags = CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWNET | CLONE_NEWIPC | SIGCHLD;
 
 	if (getenv("ZDTM_USERNS"))
 		flags |= CLONE_NEWUSER;
@@ -446,4 +516,3 @@ void ns_create(int argc, char **argv)
 
 	exit(0);
 }
-

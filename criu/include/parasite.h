@@ -1,7 +1,7 @@
 #ifndef __CR_PARASITE_H__
 #define __CR_PARASITE_H__
 
-#define PARASITE_MAX_SIZE	(64 << 10)
+#define PARASITE_MAX_SIZE (64 << 10)
 
 #ifndef __ASSEMBLY__
 
@@ -9,6 +9,8 @@
 #include <sys/time.h>
 #include <time.h>
 #include <signal.h>
+
+#include "linux/rseq.h"
 
 #include "image.h"
 #include "util-pie.h"
@@ -39,30 +41,29 @@ enum {
 	PARASITE_CMD_MAX,
 };
 
-struct parasite_vma_entry
-{
-	unsigned long	start;
-	unsigned long	len;
-	int		prot;
+struct parasite_vma_entry {
+	unsigned long start;
+	unsigned long len;
+	int prot;
 };
 
 struct parasite_vdso_vma_entry {
-	unsigned long	start;
-	unsigned long	len;
-	unsigned long	orig_vdso_addr;
-	unsigned long	orig_vvar_addr;
-	unsigned long	rt_vvar_addr;
-	int		is_marked;
-	bool		try_fill_symtable;
-	bool		is_vdso;
+	unsigned long start;
+	unsigned long len;
+	unsigned long orig_vdso_addr;
+	unsigned long orig_vvar_addr;
+	unsigned long rt_vvar_addr;
+	int is_marked;
+	bool try_fill_symtable;
+	bool is_vdso;
 };
 
 struct parasite_dump_pages_args {
-	unsigned int	nr_vmas;
-	unsigned int	add_prot;
-	unsigned int	off;
-	unsigned int	nr_segs;
-	unsigned int	nr_pages;
+	unsigned int nr_vmas;
+	unsigned int add_prot;
+	unsigned int off;
+	unsigned int nr_segs;
+	unsigned int nr_pages;
 };
 
 static inline struct parasite_vma_entry *pargs_vmas(struct parasite_dump_pages_args *a)
@@ -117,7 +118,9 @@ static inline int posix_timers_dump_size(int timer_n)
  */
 
 struct parasite_dump_misc {
-	unsigned long		brk;
+	bool has_membarrier_get_registrations; /* this is sent from criu to parasite. */
+
+	unsigned long brk;
 
 	u32 pid;
 	u32 sid;
@@ -126,33 +129,36 @@ struct parasite_dump_misc {
 
 	int dumpable;
 	int thp_disabled;
+	int child_subreaper;
+	int membarrier_registration_mask;
 };
 
 /*
  * Calculate how long we can make the groups array in parasite_dump_creds
  * and still fit the struct in one page
  */
-#define PARASITE_MAX_GROUPS							\
-	((PAGE_SIZE - sizeof(struct parasite_dump_thread) -			\
-	 offsetof(struct parasite_dump_creds, groups)) / sizeof(unsigned int)) /* groups */
+#define PARASITE_MAX_GROUPS                                                                                 \
+	((PAGE_SIZE - sizeof(struct parasite_dump_thread) - offsetof(struct parasite_dump_creds, groups)) / \
+	 sizeof(unsigned int)) /* groups */
 
 struct parasite_dump_creds {
-	unsigned int		cap_last_cap;
+	unsigned int cap_last_cap;
 
-	u32			cap_inh[CR_CAP_SIZE];
-	u32			cap_prm[CR_CAP_SIZE];
-	u32			cap_eff[CR_CAP_SIZE];
-	u32			cap_bnd[CR_CAP_SIZE];
+	u32 cap_inh[CR_CAP_SIZE];
+	u32 cap_prm[CR_CAP_SIZE];
+	u32 cap_eff[CR_CAP_SIZE];
+	u32 cap_bnd[CR_CAP_SIZE];
 
-	int			uids[4];
-	int			gids[4];
-	unsigned int		secbits;
-	unsigned int		ngroups;
+	int uids[4];
+	int gids[4];
+	int no_new_privs;
+	unsigned int secbits;
+	unsigned int ngroups;
 	/*
 	 * FIXME -- this structure is passed to parasite code
 	 * through parasite args area so in parasite_dump_creds()
 	 * call we check for size of this data fits the size of
-	 * the area. Unfortunatelly, we _actually_ use more bytes
+	 * the area. Unfortunately, we _actually_ use more bytes
 	 * than the sizeof() -- we put PARASITE_MAX_GROUPS int-s
 	 * in there, so the size check is not correct.
 	 *
@@ -161,16 +167,24 @@ struct parasite_dump_creds {
 	 * of memory in use doesn't exceed the PAGE_SIZE and the
 	 * args area is at least one page (PARASITE_ARG_SIZE_MIN).
 	 */
-	unsigned int		groups[0];
+	unsigned int groups[0];
+};
+
+struct parasite_check_rseq {
+	bool has_rseq;
+	bool has_ptrace_get_rseq_conf; /* no need to check if supported */
+	bool rseq_inited;
 };
 
 struct parasite_dump_thread {
-	unsigned int			*tid_addr;
-	pid_t				tid;
-	tls_t				tls;
-	stack_t				sas;
-	int				pdeath_sig;
-	struct parasite_dump_creds	creds[0];
+	unsigned int *tid_addr;
+	pid_t tid;
+	tls_t tls;
+	struct parasite_check_rseq rseq;
+	stack_t sas;
+	int pdeath_sig;
+	char comm[TASK_COMM_LEN];
+	struct parasite_dump_creds creds[0];
 };
 
 static inline void copy_sas(ThreadSasEntry *dst, const stack_t *src)
@@ -186,13 +200,13 @@ static inline void copy_sas(ThreadSasEntry *dst, const stack_t *src)
  * 1) struct parasite_drain_fd + all descriptors should fit into one page
  * 2) The value should be a multiple of CR_SCM_MAX_FD, because descriptors
  *    are transferred with help of send_fds and recv_fds.
- * 3) criu should work with a defaul value of the file limit (1024)
+ * 3) criu should work with a default value of the file limit (1024)
  */
-#define PARASITE_MAX_FDS	CR_SCM_MAX_FD * 3
+#define PARASITE_MAX_FDS CR_SCM_MAX_FD * 3
 
 struct parasite_drain_fd {
-	int	nr_fds;
-	int	fds[0];
+	int nr_fds;
+	int fds[0];
 };
 
 struct fd_opts {
@@ -213,16 +227,16 @@ static inline int drain_fds_size(struct parasite_drain_fd *dfds)
 }
 
 struct parasite_tty_args {
-	int	fd;
-	int	type;
+	int fd;
+	int type;
 
-	int	sid;
-	int	pgrp;
-	bool	hangup;
+	int sid;
+	int pgrp;
+	bool hangup;
 
-	int	st_pckt;
-	int	st_lock;
-	int	st_excl;
+	int st_pckt;
+	int st_lock;
+	int st_excl;
 };
 
 struct parasite_dump_cgroup_args {
@@ -231,7 +245,12 @@ struct parasite_dump_cgroup_args {
 	 *
 	 * The string is null terminated.
 	 */
-	char contents[1 << 12];
+	char contents[(1 << 12) - 32];
+	/*
+	 * Contains the path to thread cgroup procfs.
+	 * "self/task/<tid>/cgroup"
+	 */
+	char thread_cgrp[32];
 };
 
 #endif /* !__ASSEMBLY__ */

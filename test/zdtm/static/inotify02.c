@@ -11,7 +11,6 @@
 #include <sys/inotify.h>
 #include <unistd.h>
 #include <stdlib.h>
-#include <dirent.h>
 #include <signal.h>
 #include <sched.h>
 #include <sys/mount.h>
@@ -19,8 +18,8 @@
 
 #include "zdtmtst.h"
 
-const char *test_doc	= "Check for inotify file-handles storm";
-const char *test_author	= "Cyrill Gorcunov <gorcunov@openvz.org>";
+const char *test_doc = "Check for inotify file-handles storm";
+const char *test_author = "Cyrill Gorcunov <gorcunov@openvz.org>";
 
 char *dirname;
 TEST_OPTION(dirname, string, "directory name", 1);
@@ -35,7 +34,7 @@ static int num_of_handles(int fd)
 	snprintf(path, sizeof(path), "/proc/self/fdinfo/%d", fd);
 	f = fopen(path, "r");
 	if (!f) {
-		pr_err("Can't open %s", path);
+		pr_perror("Can't open %s", path);
 		return -1;
 	}
 
@@ -49,7 +48,7 @@ static int num_of_handles(int fd)
 	return ret;
 }
 
-int main (int argc, char *argv[])
+int main(int argc, char *argv[])
 {
 	const unsigned int mask = IN_DELETE | IN_CLOSE_WRITE | IN_DELETE_SELF | IN_CREATE;
 	const int nr_dirs = 64;
@@ -60,13 +59,13 @@ int main (int argc, char *argv[])
 	test_init(argc, argv);
 
 	if (mkdir(dirname, S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH)) {
-		pr_err("Can't create directory %s", dirname);
+		pr_perror("Can't create directory %s", dirname);
 		exit(1);
 	}
 
 	fd = inotify_init1(IN_NONBLOCK);
 	if (fd < 0) {
-		pr_err("inotify_init failed");
+		pr_perror("inotify_init failed");
 		exit(1);
 	}
 
@@ -74,12 +73,12 @@ int main (int argc, char *argv[])
 		snprintf(temp[i], sizeof(temp[0]), "d.%03d", i);
 		snprintf(path, sizeof(path), "%s/%s", dirname, temp[i]);
 		if (mkdir(path, S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH)) {
-			pr_err("Can't create %s", path);
+			pr_perror("Can't create %s", path);
 			exit(1);
 		}
 
 		if (inotify_add_watch(fd, path, mask) < 0) {
-			pr_err("inotify_add_watch failed on %s", path);
+			pr_perror("inotify_add_watch failed on %s", path);
 			exit(1);
 		}
 	}

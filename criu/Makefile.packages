@@ -10,16 +10,22 @@ REQ-RPM-PKG-NAMES	+= libcap-devel
 REQ-RPM-PKG-TEST-NAMES  += libaio-devel
 
 REQ-DEB-PKG-NAMES	+= libprotobuf-dev
-REQ-DEB-PKG-NAMES	+= libprotobuf-c0-dev
+REQ-DEB-PKG-NAMES	+= libprotobuf-c-dev
 REQ-DEB-PKG-NAMES	+= protobuf-c-compiler
 REQ-DEB-PKG-NAMES	+= protobuf-compiler
-REQ-DEB-PKG-NAMES	+= python-protobuf
+REQ-DEB-PKG-NAMES	+= $(PYTHON)-protobuf
 REQ-DEB-PKG-NAMES	+= libnl-3-dev
 REQ-DEB-PKG-NAMES	+= libcap-dev
 
-REQ-DEB-PKG-TEST-NAMES  += libaio-dev
+REQ-DEB-PKG-TEST-NAMES	+= $(PYTHON)-yaml
+REQ-DEB-PKG-TEST-NAMES	+= libaio-dev
 
-export LIBS		+= -lrt -lpthread -lprotobuf-c -ldl -lnl-3 -lsoccr -Lsoccr/ -lnet
+REQ-DEB-PKG-TEST-NAMES	+= libaio-dev
+
+REQ-RPM-PKG-TEST-NAMES	+= $(PYTHON)-PyYAML
+
+
+export LIBS		+= -lprotobuf-c -ldl -lnl-3 -lsoccr -Lsoccr/ -lnet
 
 check-packages-failed:
 	$(warning Can not find some of the required libraries)

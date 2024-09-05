@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 syntax = "proto2";
 
 message creds_entry {
@@ -20,4 +22,7 @@ message creds_entry {
 	repeated uint32	groups	= 14;
 
 	optional string lsm_profile = 15;
+	optional string lsm_sockcreate = 16;
+	optional bytes	apparmor_data	= 17;
+	optional uint32	no_new_privs	= 18;
 }

@@ -12,12 +12,14 @@
 
 #include "zdtmtst.h"
 
-const char *test_doc	= "Multi-process fifo loop";
-#define BUF_SIZE	256
-#define PROCS_DEF	4
+const char *test_doc = "Multi-process fifo loop";
+#define BUF_SIZE  256
+#define PROCS_DEF 4
 unsigned int num_procs = PROCS_DEF;
-TEST_OPTION(num_procs, uint, "# processes to create "
-	"(default " __stringify(PROCS_DEF) ")", 0);
+TEST_OPTION(num_procs, uint,
+	    "# processes to create "
+	    "(default " __stringify(PROCS_DEF) ")",
+	    0);
 char *filename;
 TEST_OPTION(filename, string, "file name", 1);
 
@@ -39,6 +41,7 @@ int main(int argc, char **argv)
 	int i;
 	uint8_t buf[0x100000];
 	char *file_path;
+	int pipe_size;
 
 	test_init(argc, argv);
 
@@ -59,7 +62,7 @@ int main(int argc, char **argv)
 		exit(1);
 	}
 
-	for (i = 1; i < num_procs; i++) {	/* i = 0 - parent */
+	for (i = 1; i < num_procs; i++) { /* i = 0 - parent */
 		pid = test_fork();
 		if (pid < 0) {
 			pr_perror("Can't fork");
@@ -70,24 +73,29 @@ int main(int argc, char **argv)
 			file_path = path[i - 1];
 			readfd = open(file_path, O_RDONLY);
 			if (readfd < 0) {
-				pr_perror("open(%s, O_RDONLY) failed",
-					file_path);
+				pr_perror("open(%s, O_RDONLY) failed", file_path);
 				ret = errno;
 				return ret;
 			}
 			file_path = path[i];
 			writefd = open(file_path, O_WRONLY);
 			if (writefd < 0) {
-				pr_perror("open(%s, O_WRONLY) failed",
-					file_path);
+				pr_perror("open(%s, O_WRONLY) failed", file_path);
 				ret = errno;
 				return ret;
 			}
+
+			pipe_size = fcntl(writefd, F_SETPIPE_SZ, sizeof(buf));
+			if (pipe_size != sizeof(buf)) {
+				pr_perror("fcntl(writefd, F_SETPIPE_SZ) -> %d", pipe_size);
+				kill(0, SIGKILL);
+				exit(1);
+			}
+
 			signal(SIGPIPE, SIG_IGN);
 			if (pipe_in2out(readfd, writefd, buf, sizeof(buf)) < 0)
 				/* pass errno as exit code to the parent */
-				if (test_go() /* signal NOT delivered */ ||
-						(errno != EINTR && errno != EPIPE))
+				if (test_go() /* signal NOT delivered */ || (errno != EINTR && errno != EPIPE))
 					ret = errno;
 			close(readfd);
 			close(writefd);
@@ -100,6 +108,13 @@ int main(int argc, char **argv)
 	writefd = open(file_path, O_WRONLY);
 	if (writefd < 0) {
 		pr_perror("open(%s, O_WRONLY) failed", file_path);
+		kill(0, SIGKILL);
+		exit(1);
+	}
+
+	pipe_size = fcntl(writefd, F_SETPIPE_SZ, sizeof(buf));
+	if (pipe_size != sizeof(buf)) {
+		pr_perror("fcntl(writefd, F_SETPIPE_SZ) -> %d", pipe_size);
 		kill(0, SIGKILL);
 		exit(1);
 	}
@@ -130,7 +145,7 @@ int main(int argc, char **argv)
 			if (errno == EINTR)
 				continue;
 			else {
-				fail("write failed: %m\n");
+				fail("write failed");
 				ret = 1;
 				break;
 			}
@@ -138,21 +153,22 @@ int main(int argc, char **argv)
 
 		for (p = rbuf, len = wlen; len > 0; p += rlen, len -= rlen) {
 			rlen = read(readfd, p, len);
+			if (rlen < 0 && errno == EINTR) {
+				continue;
+			}
+
 			if (rlen <= 0)
 				break;
 		}
 
-		if (rlen < 0 && errno == EINTR)
-			continue;
-
 		if (len > 0) {
-			fail("read failed: %m\n");
+			fail("read failed");
 			ret = 1;
 			break;
 		}
 
 		if (memcmp(buf, rbuf, wlen)) {
-			fail("data mismatch\n");
+			fail("data mismatch");
 			ret = 1;
 			break;
 		}
@@ -163,23 +179,22 @@ int main(int argc, char **argv)
 	test_waitsig(); /* even if failed, wait for migration to complete */
 
 	if (kill(0, SIGTERM)) {
-		fail("failed to send SIGTERM to my process group: %m\n");
-		return 1;	/* shouldn't wait() in this case */
+		fail("failed to send SIGTERM to my process group");
+		return 1; /* shouldn't wait() in this case */
 	}
 	close(readfd);
 
-	for (i = 1; i < num_procs; i++) {	/* i = 0 - parent */
+	for (i = 1; i < num_procs; i++) { /* i = 0 - parent */
 		int chret;
 		if (waitpid(pids[i], &chret, 0) < 0) {
-			fail("waitpid error: %m\n");
+			fail("waitpid error");
 			ret = 1;
 			continue;
 		}
 
 		chret = WEXITSTATUS(chret);
 		if (chret) {
-			fail("child %d exited with non-zero code %d (%s)\n",
-				i, chret, strerror(chret));
+			fail("child %d exited with non-zero code %d (%s)", i, chret, strerror(chret));
 			ret = 1;
 			continue;
 		}

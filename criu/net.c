@@ -17,6 +17,14 @@
 #include <libnl3/netlink/msg.h>
 #include <libnl3/netlink/netlink.h>
 
+#if defined(CONFIG_HAS_NFTABLES_LIB_API_0) || defined(CONFIG_HAS_NFTABLES_LIB_API_1)
+#include <nftables/libnftables.h>
+#endif
+
+#ifdef CONFIG_HAS_SELINUX
+#include <selinux/selinux.h>
+#endif
+
 #include "../soccr/soccr.h"
 
 #include "imgset.h"
@@ -37,18 +45,27 @@
 #include "util.h"
 #include "external.h"
 #include "fdstore.h"
+#include "netfilter.h"
 
 #include "protobuf.h"
 #include "images/netdev.pb-c.h"
+#include "images/inventory.pb-c.h"
+
+#undef LOG_PREFIX
+#define LOG_PREFIX "net: "
+
+#ifndef IFLA_NEW_IFINDEX
+#define IFLA_NEW_IFINDEX 49
+#endif
 
 #ifndef IFLA_LINK_NETNSID
-#define IFLA_LINK_NETNSID	37
+#define IFLA_LINK_NETNSID 37
 #undef IFLA_MAX
 #define IFLA_MAX IFLA_LINK_NETNSID
 #endif
 
 #ifndef RTM_NEWNSID
-#define RTM_NEWNSID		88
+#define RTM_NEWNSID 88
 #endif
 
 #ifndef IFLA_MACVLAN_FLAGS
@@ -77,7 +94,7 @@ enum {
 	IFLA_IPTUN_ENCAP_DPORT,
 	__IFLA_IPTUN_MAX,
 };
-#define IFLA_IPTUN_MAX  (__IFLA_IPTUN_MAX - 1)
+#define IFLA_IPTUN_MAX (__IFLA_IPTUN_MAX - 1)
 
 static int ns_sysfs_fd = -1;
 
@@ -94,15 +111,18 @@ int read_ns_sys_file(char *path, char *buf, int len)
 	}
 
 	rlen = read(fd, buf, len);
+	if (rlen == -1)
+		pr_perror("Can't read ns' %s", path);
 	close(fd);
 
 	if (rlen == len) {
+		buf[0] = '\0';
 		pr_err("Too small buffer to read ns sys file %s\n", path);
 		return -1;
 	}
 
-	if (rlen > 0)
-		buf[rlen - 1] = '\0';
+	if (rlen >= 0)
+		buf[rlen] = '\0';
 
 	return rlen;
 }
@@ -113,11 +133,11 @@ static bool sysctl_entries_equal(SysctlEntry *a, SysctlEntry *b)
 		return false;
 
 	switch (a->type) {
-		case SYSCTL_TYPE__CTL_32:
-			return a->has_iarg && b->has_iarg && a->iarg == b->iarg;
-		case SYSCTL_TYPE__CTL_STR:
-			return a->sarg && b->sarg && !strcmp(a->sarg, b->sarg);
-		default:;
+	case SYSCTL_TYPE__CTL_32:
+		return a->has_iarg && b->has_iarg && a->iarg == b->iarg;
+	case SYSCTL_TYPE__CTL_STR:
+		return a->sarg && b->sarg && !strcmp(a->sarg, b->sarg);
+	default:;
 	}
 
 	return false;
@@ -201,13 +221,25 @@ char *devconfs6[] = {
 	"use_tempaddr",
 };
 
-#define CONF_OPT_PATH "net/%s/conf/%s/%s"
-#define MAX_CONF_OPT_PATH IFNAMSIZ+60
-#define MAX_STR_CONF_LEN 200
+#define CONF_OPT_PATH	  "net/%s/conf/%s/%s"
+#define MAX_CONF_OPT_PATH IFNAMSIZ + 60
+#define MAX_STR_CONF_LEN  200
 
-static int net_conf_op(char *tgt, SysctlEntry **conf, int n, int op, char *proto,
-		struct sysctl_req *req, char (*path)[MAX_CONF_OPT_PATH], int size,
-		char **devconfs, SysctlEntry **def_conf)
+static const char *unix_conf_entries[] = {
+	"max_dgram_qlen",
+};
+
+/*
+ * MAX_CONF_UNIX_PATH = (sizeof(CONF_UNIX_FMT) - strlen("%s"))
+ * 					  + MAX_CONF_UNIX_OPT_PATH
+ */
+#define CONF_UNIX_BASE	       "net/unix"
+#define CONF_UNIX_FMT	       CONF_UNIX_BASE "/%s"
+#define MAX_CONF_UNIX_OPT_PATH 32
+#define MAX_CONF_UNIX_PATH     (sizeof(CONF_UNIX_FMT) + MAX_CONF_UNIX_OPT_PATH - 2)
+
+static int net_conf_op(char *tgt, SysctlEntry **conf, int n, int op, char *proto, struct sysctl_req *req,
+		       char (*path)[MAX_CONF_OPT_PATH], int size, char **devconfs, SysctlEntry **def_conf)
 {
 	int i, ri, ar = -1;
 	int ret, flags = op == CTL_READ ? CTL_FLAGS_OPTIONAL : 0;
@@ -233,8 +265,7 @@ static int net_conf_op(char *tgt, SysctlEntry **conf, int n, int op, char *proto
 		 * mtu may be changed by disable_ipv6 so we can not skip
 		 * it's restore
 		 */
-		if (def_conf && sysctl_entries_equal(conf[i], def_conf[i])
-				&& strcmp(devconfs[i], "mtu")) {
+		if (def_conf && sysctl_entries_equal(conf[i], def_conf[i]) && strcmp(devconfs[i], "mtu")) {
 			pr_debug("Skip %s/%s, coincides with default\n", tgt, devconfs[i]);
 			continue;
 		}
@@ -252,36 +283,34 @@ static int net_conf_op(char *tgt, SysctlEntry **conf, int n, int op, char *proto
 		req[ri].name = path[i];
 		req[ri].flags = flags;
 		switch (conf[i]->type) {
-			case SYSCTL_TYPE__CTL_32:
-				req[ri].type = CTL_32;
+		case SYSCTL_TYPE__CTL_32:
+			req[ri].type = CTL_32;
 
-				/* skip non-existing sysctl */
-				if (op == CTL_WRITE && !conf[i]->has_iarg)
-					continue;
-
-				req[ri].arg = &conf[i]->iarg;
-				break;
-			case SYSCTL_TYPE__CTL_STR:
-				req[ri].type = CTL_STR(MAX_STR_CONF_LEN);
-				req[ri].flags |= op == CTL_READ && !strcmp(devconfs[i], "stable_secret")
-					? CTL_FLAGS_READ_EIO_SKIP : 0;
-
-				/* skip non-existing sysctl */
-				if (op == CTL_WRITE && !conf[i]->sarg)
-					continue;
-
-				req[ri].arg = conf[i]->sarg;
-				break;
-			default:
+			/* skip non-existing sysctl */
+			if (op == CTL_WRITE && !conf[i]->has_iarg)
 				continue;
+
+			req[ri].arg = &conf[i]->iarg;
+			break;
+		case SYSCTL_TYPE__CTL_STR:
+			req[ri].type = CTL_STR(MAX_STR_CONF_LEN);
+			req[ri].flags |=
+				op == CTL_READ && !strcmp(devconfs[i], "stable_secret") ? CTL_FLAGS_READ_EIO_SKIP : 0;
+
+			/* skip non-existing sysctl */
+			if (op == CTL_WRITE && !conf[i]->sarg)
+				continue;
+
+			req[ri].arg = conf[i]->sarg;
+			break;
+		default:
+			continue;
 		}
 		rconf[ri] = conf[i];
 		ri++;
 	}
 
-	if (ar != -1
-	    && conf[ar]->type == SYSCTL_TYPE__CTL_32
-	    && conf[ar]->has_iarg) {
+	if (ar != -1 && conf[ar]->type == SYSCTL_TYPE__CTL_32 && conf[ar]->has_iarg) {
 		snprintf(path[ar], MAX_CONF_OPT_PATH, CONF_OPT_PATH, proto, tgt, devconfs[ar]);
 		req[ri].name = path[ar];
 		req[ri].type = CTL_32;
@@ -293,7 +322,7 @@ static int net_conf_op(char *tgt, SysctlEntry **conf, int n, int op, char *proto
 
 	ret = sysctl_op(req, ri, op, CLONE_NEWNET);
 	if (ret < 0) {
-		pr_err("Failed to %s %s/<confs>\n", (op == CTL_READ)?"read":"write", tgt);
+		pr_err("Failed to %s %s/<confs>\n", (op == CTL_READ) ? "read" : "write", tgt);
 		goto err_free;
 	}
 
@@ -319,9 +348,7 @@ static int ipv4_conf_op(char *tgt, SysctlEntry **conf, int n, int op, SysctlEntr
 	struct sysctl_req req[ARRAY_SIZE(devconfs4)];
 	char path[ARRAY_SIZE(devconfs4)][MAX_CONF_OPT_PATH];
 
-	return net_conf_op(tgt, conf, n, op, "ipv4",
-			req, path, ARRAY_SIZE(devconfs4),
-			devconfs4, def_conf);
+	return net_conf_op(tgt, conf, n, op, "ipv4", req, path, ARRAY_SIZE(devconfs4), devconfs4, def_conf);
 }
 
 static int ipv6_conf_op(char *tgt, SysctlEntry **conf, int n, int op, SysctlEntry **def_conf)
@@ -329,9 +356,68 @@ static int ipv6_conf_op(char *tgt, SysctlEntry **conf, int n, int op, SysctlEntr
 	struct sysctl_req req[ARRAY_SIZE(devconfs6)];
 	char path[ARRAY_SIZE(devconfs6)][MAX_CONF_OPT_PATH];
 
-	return net_conf_op(tgt, conf, n, op, "ipv6",
-			req, path, ARRAY_SIZE(devconfs6),
-			devconfs6, def_conf);
+	return net_conf_op(tgt, conf, n, op, "ipv6", req, path, ARRAY_SIZE(devconfs6), devconfs6, def_conf);
+}
+
+static int unix_conf_op(SysctlEntry ***rconf, size_t *n, int op)
+{
+	int i, ret = -1, flags = 0;
+	char path[ARRAY_SIZE(unix_conf_entries)][MAX_CONF_UNIX_PATH] = {};
+	struct sysctl_req req[ARRAY_SIZE(unix_conf_entries)] = {};
+	SysctlEntry **conf = *rconf;
+
+	if (*n != ARRAY_SIZE(unix_conf_entries)) {
+		pr_err("unix: Unexpected entries in config (%zu %zu)\n", *n, ARRAY_SIZE(unix_conf_entries));
+		return -EINVAL;
+	}
+
+	if (opts.weak_sysctls || op == CTL_READ)
+		flags = CTL_FLAGS_OPTIONAL;
+
+	for (i = 0; i < *n; i++) {
+		snprintf(path[i], MAX_CONF_UNIX_PATH, CONF_UNIX_FMT, unix_conf_entries[i]);
+		req[i].name = path[i];
+		req[i].flags = flags;
+
+		switch (conf[i]->type) {
+		case SYSCTL_TYPE__CTL_32:
+			req[i].type = CTL_32;
+			req[i].arg = &conf[i]->iarg;
+			break;
+		default:
+			pr_err("unix: Unknown config type %d\n", conf[i]->type);
+			return -1;
+		}
+	}
+
+	ret = sysctl_op(req, *n, op, CLONE_NEWNET);
+	if (ret < 0) {
+		pr_err("unix: Failed to %s %s/<confs>\n", (op == CTL_READ) ? "read" : "write", CONF_UNIX_BASE);
+		return -1;
+	}
+
+	if (op == CTL_READ) {
+		bool has_entries = false;
+
+		for (i = 0; i < *n; i++) {
+			if (req[i].flags & CTL_FLAGS_HAS) {
+				conf[i]->has_iarg = true;
+				if (!has_entries)
+					has_entries = true;
+			}
+		}
+
+		/*
+		 * Zap the whole section of data.
+		 * Unix conf is optional.
+		 */
+		if (!has_entries) {
+			*n = 0;
+			*rconf = NULL;
+		}
+	}
+
+	return 0;
 }
 
 /*
@@ -339,7 +425,7 @@ static int ipv6_conf_op(char *tgt, SysctlEntry **conf, int n, int op, SysctlEntr
  * the kernel, simply write DEVCONFS_UNUSED
  * into the image so we would skip it.
  */
-#define DEVCONFS_UNUSED        (-1u)
+#define DEVCONFS_UNUSED (-1u)
 
 static int ipv4_conf_op_old(char *tgt, int *conf, int n, int op, int *def_conf)
 {
@@ -379,7 +465,7 @@ static int ipv4_conf_op_old(char *tgt, int *conf, int n, int op, int *def_conf)
 
 	ret = sysctl_op(req, ri, op, CLONE_NEWNET);
 	if (ret < 0) {
-		pr_err("Failed to %s %s/<confs>\n", (op == CTL_READ)?"read":"write", tgt);
+		pr_err("Failed to %s %s/<confs>\n", (op == CTL_READ) ? "read" : "write", tgt);
 		return -1;
 	}
 	return 0;
@@ -401,9 +487,8 @@ static int lookup_net_by_netid(struct ns_id *ns, int net_id)
 	return -1;
 }
 
-static int dump_one_netdev(int type, struct ifinfomsg *ifi,
-		struct nlattr **tb, struct ns_id *ns, struct cr_imgset *fds,
-		int (*dump)(NetDeviceEntry *, struct cr_imgset *, struct nlattr **info))
+static int dump_one_netdev(int type, struct ifinfomsg *ifi, struct nlattr **tb, struct ns_id *ns, struct cr_imgset *fds,
+			   int (*dump)(NetDeviceEntry *, struct cr_imgset *, struct nlattr **info))
 {
 	int ret = -1, i, peer_ifindex;
 	NetDeviceEntry netdev = NET_DEVICE_ENTRY__INIT;
@@ -438,16 +523,14 @@ static int dump_one_netdev(int type, struct ifinfomsg *ifi,
 		if (tb[IFLA_LINK_NETNSID])
 			nsid = nla_get_s32(tb[IFLA_LINK_NETNSID]);
 
-		pr_debug("The peer link is in the %d netns with the %u index\n",
-						nsid, netdev.peer_ifindex);
+		pr_debug("The peer link is in the %d netns with the %u index\n", nsid, netdev.peer_ifindex);
 
 		if (nsid == -1)
 			nsid = ns->id;
 		else
 			nsid = lookup_net_by_netid(ns, nsid);
 		if (nsid < 0) {
-			pr_warn("The %s veth is in an external netns\n",
-								netdev.name);
+			pr_warn("The %s veth is in an external netns\n", netdev.name);
 		} else {
 			netdev.has_peer_nsid = true;
 			netdev.peer_nsid = nsid;
@@ -462,9 +545,8 @@ static int dump_one_netdev(int type, struct ifinfomsg *ifi,
 		netdev.has_address = true;
 		netdev.address.data = nla_data(tb[IFLA_ADDRESS]);
 		netdev.address.len = nla_len(tb[IFLA_ADDRESS]);
-		pr_info("Found ll addr (%02x:../%d) for %s\n",
-				(int)netdev.address.data[0],
-				(int)netdev.address.len, netdev.name);
+		pr_info("Found ll addr (%02x:../%d) for %s\n", (int)netdev.address.data[0], (int)netdev.address.len,
+			netdev.name);
 	}
 
 	if (tb[IFLA_MASTER]) {
@@ -554,8 +636,8 @@ static char *link_kind(struct ifinfomsg *ifi, struct nlattr **tb)
 	return nla_data(linkinfo[IFLA_INFO_KIND]);
 }
 
-static int dump_unknown_device(struct ifinfomsg *ifi, char *kind,
-		struct nlattr **tb, struct ns_id *ns, struct cr_imgset *fds)
+static int dump_unknown_device(struct ifinfomsg *ifi, char *kind, struct nlattr **tb, struct ns_id *ns,
+			       struct cr_imgset *fds)
 {
 	int ret;
 
@@ -564,8 +646,7 @@ static int dump_unknown_device(struct ifinfomsg *ifi, char *kind,
 		return dump_one_netdev(ND_TYPE__EXTLINK, ifi, tb, ns, fds, NULL);
 
 	if (ret == -ENOTSUP)
-		pr_err("Unsupported link %d (type %d kind %s)\n",
-				ifi->ifi_index, ifi->ifi_type, kind);
+		pr_err("Unsupported link %d (type %d kind %s)\n", ifi->ifi_index, ifi->ifi_type, kind);
 	return -1;
 }
 
@@ -578,7 +659,7 @@ static int dump_macvlan(NetDeviceEntry *nde, struct cr_imgset *imgset, struct nl
 {
 	MacvlanLinkEntry macvlan = MACVLAN_LINK_ENTRY__INIT;
 	int ret;
-	struct nlattr *data[IFLA_MACVLAN_FLAGS+1];
+	struct nlattr *data[IFLA_MACVLAN_FLAGS + 1];
 
 	if (!info || !info[IFLA_INFO_DATA]) {
 		pr_err("no data for macvlan\n");
@@ -587,7 +668,7 @@ static int dump_macvlan(NetDeviceEntry *nde, struct cr_imgset *imgset, struct nl
 
 	ret = nla_parse_nested(data, IFLA_MACVLAN_FLAGS, info[IFLA_INFO_DATA], NULL);
 	if (ret < 0) {
-		pr_err("failed ot parse macvlan data\n");
+		pr_err("failed to parse macvlan data\n");
 		return -1;
 	}
 
@@ -599,14 +680,14 @@ static int dump_macvlan(NetDeviceEntry *nde, struct cr_imgset *imgset, struct nl
 	macvlan.mode = *((u32 *)RTA_DATA(data[IFLA_MACVLAN_MODE]));
 
 	if (data[IFLA_MACVLAN_FLAGS])
-		macvlan.flags = *((u16 *) RTA_DATA(data[IFLA_MACVLAN_FLAGS]));
+		macvlan.flags = *((u16 *)RTA_DATA(data[IFLA_MACVLAN_FLAGS]));
 
 	nde->macvlan = &macvlan;
 	return write_netdev_img(nde, imgset, info);
 }
 
-static int dump_one_ethernet(struct ifinfomsg *ifi, char *kind,
-		struct nlattr **tb, struct ns_id *ns, struct cr_imgset *fds)
+static int dump_one_ethernet(struct ifinfomsg *ifi, char *kind, struct nlattr **tb, struct ns_id *ns,
+			     struct cr_imgset *fds)
 {
 	if (!strcmp(kind, "veth"))
 		/*
@@ -643,8 +724,8 @@ static int dump_one_ethernet(struct ifinfomsg *ifi, char *kind,
 	return dump_unknown_device(ifi, kind, tb, ns, fds);
 }
 
-static int dump_one_gendev(struct ifinfomsg *ifi, char *kind,
-		struct nlattr **tb, struct ns_id *ns, struct cr_imgset *fds)
+static int dump_one_gendev(struct ifinfomsg *ifi, char *kind, struct nlattr **tb, struct ns_id *ns,
+			   struct cr_imgset *fds)
 {
 	if (!strcmp(kind, "tun"))
 		return dump_one_netdev(ND_TYPE__TUN, ifi, tb, ns, fds, dump_tun_link);
@@ -652,8 +733,8 @@ static int dump_one_gendev(struct ifinfomsg *ifi, char *kind,
 	return dump_unknown_device(ifi, kind, tb, ns, fds);
 }
 
-static int dump_one_voiddev(struct ifinfomsg *ifi, char *kind,
-		struct nlattr **tb, struct ns_id *ns, struct cr_imgset *fds)
+static int dump_one_voiddev(struct ifinfomsg *ifi, char *kind, struct nlattr **tb, struct ns_id *ns,
+			    struct cr_imgset *fds)
 {
 	if (!strcmp(kind, "venet"))
 		return dump_one_netdev(ND_TYPE__VENET, ifi, tb, ns, fds, NULL);
@@ -661,8 +742,7 @@ static int dump_one_voiddev(struct ifinfomsg *ifi, char *kind,
 	return dump_unknown_device(ifi, kind, tb, ns, fds);
 }
 
-static int dump_one_gre(struct ifinfomsg *ifi, char *kind,
-		struct nlattr **tb, struct ns_id *ns, struct cr_imgset *fds)
+static int dump_one_gre(struct ifinfomsg *ifi, char *kind, struct nlattr **tb, struct ns_id *ns, struct cr_imgset *fds)
 {
 	if (!strcmp(kind, "gre")) {
 		char *name = (char *)RTA_DATA(tb[IFLA_IFNAME]);
@@ -698,15 +778,16 @@ static int dump_sit(NetDeviceEntry *nde, struct cr_imgset *imgset, struct nlattr
 	pr_info("Some data for SIT provided\n");
 	ret = nla_parse_nested(data, IFLA_IPTUN_MAX, info[IFLA_INFO_DATA], NULL);
 	if (ret < 0) {
-		pr_err("failed ot parse sit data\n");
+		pr_err("failed to parse sit data\n");
 		return -1;
 	}
 
-#define ENCODE_ENTRY(__type, __ifla, __proto)	do {			\
-		if (data[__ifla]) {					\
-			se.__proto = *(__type *)nla_data(data[__ifla]);	\
-			se.has_##__proto = true;			\
-		}							\
+#define ENCODE_ENTRY(__type, __ifla, __proto)                           \
+	do {                                                            \
+		if (data[__ifla]) {                                     \
+			se.__proto = *(__type *)nla_data(data[__ifla]); \
+			se.has_##__proto = true;                        \
+		}                                                       \
 	} while (0)
 
 	if (data[IFLA_IPTUN_LOCAL]) {
@@ -725,11 +806,11 @@ static int dump_sit(NetDeviceEntry *nde, struct cr_imgset *imgset, struct nlattr
 		}
 	}
 
-	ENCODE_ENTRY(u32, IFLA_IPTUN_LINK,  link);
-	ENCODE_ENTRY(u8,  IFLA_IPTUN_TTL,   ttl);
-	ENCODE_ENTRY(u8,  IFLA_IPTUN_TOS,   tos);
+	ENCODE_ENTRY(u32, IFLA_IPTUN_LINK, link);
+	ENCODE_ENTRY(u8, IFLA_IPTUN_TTL, ttl);
+	ENCODE_ENTRY(u8, IFLA_IPTUN_TOS, tos);
 	ENCODE_ENTRY(u16, IFLA_IPTUN_FLAGS, flags);
-	ENCODE_ENTRY(u8,  IFLA_IPTUN_PROTO, proto);
+	ENCODE_ENTRY(u8, IFLA_IPTUN_PROTO, proto);
 
 	if (data[IFLA_IPTUN_PMTUDISC]) {
 		u8 v;
@@ -739,7 +820,7 @@ static int dump_sit(NetDeviceEntry *nde, struct cr_imgset *imgset, struct nlattr
 			se.pmtudisc = se.has_pmtudisc = true;
 	}
 
-	ENCODE_ENTRY(u16, IFLA_IPTUN_ENCAP_TYPE,  encap_type);
+	ENCODE_ENTRY(u16, IFLA_IPTUN_ENCAP_TYPE, encap_type);
 	ENCODE_ENTRY(u16, IFLA_IPTUN_ENCAP_FLAGS, encap_flags);
 	ENCODE_ENTRY(u16, IFLA_IPTUN_ENCAP_SPORT, encap_sport);
 	ENCODE_ENTRY(u16, IFLA_IPTUN_ENCAP_DPORT, encap_dport);
@@ -772,7 +853,7 @@ static int dump_sit(NetDeviceEntry *nde, struct cr_imgset *imgset, struct nlattr
 		memcpy(&rl_prefix, nla_data(data[IFLA_IPTUN_6RD_RELAY_PREFIX]), sizeof(rl_prefix));
 		se.n_relay_prefix = 1;
 		se.relay_prefix = &rl_prefix;
-skip:;
+	skip:;
 	}
 
 #undef ENCODE_ENTRY
@@ -781,8 +862,7 @@ skip:;
 	return write_netdev_img(nde, imgset, info);
 }
 
-static int dump_one_sit(struct ifinfomsg *ifi, char *kind,
-		struct nlattr **tb, struct ns_id *ns, struct cr_imgset *fds)
+static int dump_one_sit(struct ifinfomsg *ifi, char *kind, struct nlattr **tb, struct ns_id *ns, struct cr_imgset *fds)
 {
 	char *name;
 
@@ -852,7 +932,7 @@ static int dump_one_link(struct nlmsghdr *hdr, struct ns_id *ns, void *arg)
 		ret = dump_one_sit(ifi, kind, tb, ns, fds);
 		break;
 	default:
-unk:
+	unk:
 		ret = dump_unknown_device(ifi, kind, tb, ns, fds);
 		break;
 	}
@@ -876,7 +956,7 @@ static int dump_one_nf(struct nlmsghdr *hdr, struct ns_id *ns, void *arg)
 static int ct_restore_callback(struct nlmsghdr *nlh)
 {
 	struct nfgenmsg *msg;
-	struct nlattr *tb[CTA_MAX+1], *tbp[CTA_PROTOINFO_MAX + 1], *tb_tcp[CTA_PROTOINFO_TCP_MAX+1];
+	struct nlattr *tb[CTA_MAX + 1], *tbp[CTA_PROTOINFO_MAX + 1], *tb_tcp[CTA_PROTOINFO_TCP_MAX + 1];
 	int err;
 
 	msg = NLMSG_DATA(nlh);
@@ -972,7 +1052,7 @@ static int restore_nf_ct(int pid, int type)
 			if (ct_restore_callback(nlh))
 				goto out;
 
-		nlh->nlmsg_flags = NLM_F_REQUEST|NLM_F_ACK|NLM_F_CREATE;
+		nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE;
 		ret = do_rtnl_req(sk, nlh, nlh->nlmsg_len, NULL, NULL, NULL, NULL);
 		if (ret)
 			goto out;
@@ -1026,7 +1106,6 @@ static int dump_nf_ct(struct cr_imgset *fds, int type)
 	close(sk);
 out:
 	return ret;
-
 }
 
 /*
@@ -1049,7 +1128,7 @@ static int list_links(int rtsk, void *args)
 	memset(&req, 0, sizeof(req));
 	req.nlh.nlmsg_len = sizeof(req);
 	req.nlh.nlmsg_type = RTM_GETLINK;
-	req.nlh.nlmsg_flags = NLM_F_ROOT|NLM_F_MATCH|NLM_F_REQUEST;
+	req.nlh.nlmsg_flags = NLM_F_ROOT | NLM_F_MATCH | NLM_F_REQUEST;
 	req.nlh.nlmsg_pid = 0;
 	req.nlh.nlmsg_seq = CR_NLMSG_SEQ;
 	req.g.rtgen_family = AF_PACKET;
@@ -1069,7 +1148,7 @@ static int dump_links(int rtsk, struct ns_id *ns, struct cr_imgset *fds)
 	memset(&req, 0, sizeof(req));
 	req.nlh.nlmsg_len = sizeof(req);
 	req.nlh.nlmsg_type = RTM_GETLINK;
-	req.nlh.nlmsg_flags = NLM_F_ROOT|NLM_F_MATCH|NLM_F_REQUEST;
+	req.nlh.nlmsg_flags = NLM_F_ROOT | NLM_F_MATCH | NLM_F_REQUEST;
 	req.nlh.nlmsg_pid = 0;
 	req.nlh.nlmsg_seq = CR_NLMSG_SEQ;
 	req.g.rtgen_family = AF_PACKET;
@@ -1079,7 +1158,13 @@ static int dump_links(int rtsk, struct ns_id *ns, struct cr_imgset *fds)
 
 static int restore_link_cb(struct nlmsghdr *hdr, struct ns_id *ns, void *arg)
 {
-	pr_info("Got response on SETLINK =)\n");
+	pr_info("Got response on SETLINK.\n");
+	return 0;
+}
+
+static int restore_newlink_cb(struct nlmsghdr *hdr, struct ns_id *ns, void *arg)
+{
+	pr_info("Got response on RTM_NEWLINK.\n");
 	return 0;
 }
 
@@ -1093,22 +1178,21 @@ struct newlink_req {
  * request.
  */
 struct newlink_extras {
-	int link;		/* IFLA_LINK */
-	int target_netns;	/* IFLA_NET_NS_FD */
+	int link;	  /* IFLA_LINK */
+	int target_netns; /* IFLA_NET_NS_FD */
 };
 
 typedef int (*link_info_t)(struct ns_id *ns, struct net_link *, struct newlink_req *);
 
-static int populate_newlink_req(struct ns_id *ns, struct newlink_req *req,
-			int msg_type, struct net_link * link,
-			link_info_t link_info, struct newlink_extras *extras)
+static int populate_newlink_req(struct ns_id *ns, struct newlink_req *req, int msg_type, struct net_link *link,
+				link_info_t link_info, struct newlink_extras *extras)
 {
 	NetDeviceEntry *nde = link->nde;
 
 	memset(req, 0, sizeof(*req));
 
 	req->h.nlmsg_len = NLMSG_LENGTH(sizeof(struct ifinfomsg));
-	req->h.nlmsg_flags = NLM_F_REQUEST|NLM_F_ACK|NLM_F_CREATE;
+	req->h.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE;
 	req->h.nlmsg_type = msg_type;
 	req->h.nlmsg_seq = CR_NLMSG_SEQ;
 	req->i.ifi_family = AF_PACKET;
@@ -1126,18 +1210,16 @@ static int populate_newlink_req(struct ns_id *ns, struct newlink_req *req,
 			addattr_l(&req->h, sizeof(*req), IFLA_LINK, &extras->link, sizeof(extras->link));
 
 		if (extras->target_netns >= 0)
-			addattr_l(&req->h, sizeof(*req), IFLA_NET_NS_FD, &extras->target_netns, sizeof(extras->target_netns));
-
+			addattr_l(&req->h, sizeof(*req), IFLA_NET_NS_FD, &extras->target_netns,
+				  sizeof(extras->target_netns));
 	}
 
 	addattr_l(&req->h, sizeof(*req), IFLA_IFNAME, nde->name, strlen(nde->name));
 	addattr_l(&req->h, sizeof(*req), IFLA_MTU, &nde->mtu, sizeof(nde->mtu));
 
 	if (nde->has_address) {
-		pr_debug("Restore ll addr (%02x:../%d) for device\n",
-				(int)nde->address.data[0], (int)nde->address.len);
-		addattr_l(&req->h, sizeof(*req), IFLA_ADDRESS,
-				nde->address.data, nde->address.len);
+		pr_debug("Restore ll addr (%02x:../%d) for device\n", (int)nde->address.data[0], (int)nde->address.len);
+		addattr_l(&req->h, sizeof(*req), IFLA_ADDRESS, nde->address.data, nde->address.len);
 	}
 
 	if (link_info) {
@@ -1157,9 +1239,57 @@ static int populate_newlink_req(struct ns_id *ns, struct newlink_req *req,
 	return 0;
 }
 
-static int do_rtm_link_req(int msg_type,
-			struct net_link *link, int nlsk, struct ns_id *ns,
-			link_info_t link_info, struct newlink_extras *extras)
+static int kerndat_newifindex_err_cb(int err, struct ns_id *ns, void *arg)
+{
+	switch (err) {
+	case -ENODEV:
+		kdat.has_newifindex = false;
+		break;
+	case -ERANGE:
+		kdat.has_newifindex = true;
+		break;
+	default:
+		pr_err("Unexpected error: %d(%s)\n", err, strerror(-err));
+		break;
+	}
+	return 0;
+}
+
+int kerndat_has_newifindex(void)
+{
+	struct newlink_req req = {};
+	int ifindex = -1;
+	int sk, ret;
+
+	kdat.has_newifindex = false;
+	sk = socket(PF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+	if (sk < 0) {
+		pr_perror("Unable to create a netlink socket");
+		return -1;
+	}
+	memset(&req, 0, sizeof(req));
+
+	req.h.nlmsg_len = NLMSG_LENGTH(sizeof(struct ifinfomsg));
+	req.h.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE;
+	req.h.nlmsg_type = RTM_SETLINK;
+	req.h.nlmsg_seq = CR_NLMSG_SEQ;
+	req.i.ifi_family = AF_UNSPEC;
+
+	/*
+	 * ifindex is negative, so the kernel will return ERANGE if
+	 * IFLA_NEW_IFINDEX is supported.
+	 */
+	addattr_l(&req.h, sizeof(req), IFLA_NEW_IFINDEX, &ifindex, sizeof(ifindex));
+	/* criu-kdat doesn't exist, so the kernel will return ENODEV. */
+	addattr_l(&req.h, sizeof(req), IFLA_IFNAME, "criu-kdat", 9);
+
+	ret = do_rtnl_req(sk, &req, sizeof(req), restore_link_cb, kerndat_newifindex_err_cb, NULL, NULL);
+	close(sk);
+	return ret;
+}
+
+static int do_rtm_link_req(int msg_type, struct net_link *link, int nlsk, struct ns_id *ns, link_info_t link_info,
+			   struct newlink_extras *extras)
 {
 	struct newlink_req req;
 
@@ -1174,11 +1304,114 @@ int restore_link_parms(struct net_link *link, int nlsk)
 	return do_rtm_link_req(RTM_SETLINK, link, nlsk, NULL, NULL, NULL);
 }
 
-static int restore_one_link(struct ns_id *ns, struct net_link *link, int nlsk,
-			link_info_t link_info, struct newlink_extras *extras)
+static int restore_one_link(struct ns_id *ns, struct net_link *link, int nlsk, link_info_t link_info,
+			    struct newlink_extras *extras)
 {
 	pr_info("Restoring netdev %s idx %d\n", link->nde->name, link->nde->ifindex);
 	return do_rtm_link_req(RTM_NEWLINK, link, nlsk, ns, link_info, extras);
+}
+
+struct move_req {
+	struct newlink_req req;
+	char ifnam[IFNAMSIZ];
+};
+
+static int move_veth_cb(void *arg, int fd, pid_t pid)
+{
+	int fd_ns_old = -1, ret = -1;
+	struct move_req *mvreq = arg;
+	struct newlink_req *req = &mvreq->req;
+	int ifindex, nlsk;
+
+	if (!(root_ns_mask & CLONE_NEWUSER)) {
+		int fd_ns;
+
+		fd_ns = get_service_fd(NS_FD_OFF);
+		if (switch_ns_by_fd(fd_ns, &net_ns_desc, &fd_ns_old))
+			return -1;
+	}
+
+	/* Retrieve ifindex of precreated veth device in source netns. */
+	ifindex = if_nametoindex(mvreq->ifnam);
+	if (!ifindex)
+		goto out;
+	req->i.ifi_index = ifindex;
+
+	/* Tell netlink what netns we want to move that veth device into. */
+	addattr_l(&req->h, sizeof(*req), IFLA_NET_NS_FD, &fd, sizeof(fd));
+
+	nlsk = socket(PF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
+	if (nlsk < 0)
+		goto out;
+
+	ret = do_rtnl_req(nlsk, req, req->h.nlmsg_len, restore_newlink_cb, NULL, NULL, NULL);
+	close(nlsk);
+
+out:
+	if (fd_ns_old >= 0)
+		ret = restore_ns(fd_ns_old, &net_ns_desc);
+
+	return ret;
+}
+
+static int move_veth(const char *netdev, struct ns_id *ns, struct net_link *link, int nlsk)
+{
+	NetDeviceEntry *nde = link->nde;
+	struct newlink_req *req;
+	struct move_req mvreq;
+	size_t len_val;
+	int ret;
+
+	if (!kdat.has_newifindex) {
+		pr_err("Unable to specify ifindex in the target namespace.\n");
+		return -1;
+	}
+
+	/*
+	 * We require a target ifindex otherwise we can't restore addresses
+	 * later on as ip stores ifindex in its address dump for network
+	 * devices.
+	 */
+	if (!nde->ifindex)
+		return -1;
+
+	memset(&mvreq.req, 0, sizeof(mvreq.req));
+	req = &mvreq.req;
+
+	req->h.nlmsg_len = NLMSG_LENGTH(sizeof(struct ifinfomsg));
+	req->h.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+	req->h.nlmsg_type = RTM_NEWLINK;
+	req->h.nlmsg_seq = CR_NLMSG_SEQ;
+
+	req->i.ifi_family = AF_UNSPEC;
+	req->i.ifi_flags = nde->flags;
+
+	/* Tell netlink what name we want in the target netns. */
+	addattr_l(&req->h, sizeof(*req), IFLA_IFNAME, nde->name, strlen(nde->name));
+
+	/* Tell netlink what mtu we want in the target netns. */
+	addattr_l(&req->h, sizeof(*req), IFLA_MTU, &nde->mtu, sizeof(nde->mtu));
+
+	/* Tell netlink what ifindex we want in the target netns. */
+	addattr_l(&req->h, sizeof(*req), IFLA_NEW_IFINDEX, &nde->ifindex, sizeof(nde->ifindex));
+
+	if (nde->has_address) {
+		pr_debug("Restore ll addr (%02x:../%d) for device with target ifindex %d\n", (int)nde->address.data[0],
+			 (int)nde->address.len, nde->ifindex);
+		addattr_l(&req->h, sizeof(*req), IFLA_ADDRESS, nde->address.data, nde->address.len);
+	}
+
+	len_val = strlen(netdev);
+	if (len_val >= IFNAMSIZ)
+		return -1;
+	__strlcpy(mvreq.ifnam, netdev, IFNAMSIZ);
+
+	ret = userns_call(move_veth_cb, 0, &mvreq, sizeof(mvreq), ns->net.ns_fd);
+	if (ret < 0)
+		return -1;
+
+	link->created = true;
+	return 0;
 }
 
 #ifndef VETH_INFO_MAX
@@ -1187,16 +1420,15 @@ enum {
 	VETH_INFO_PEER,
 
 	__VETH_INFO_MAX
-#define VETH_INFO_MAX   (__VETH_INFO_MAX - 1)
+#define VETH_INFO_MAX (__VETH_INFO_MAX - 1)
 };
 #endif
 
 #if IFLA_MAX <= 28
-#define IFLA_NET_NS_FD	28
+#define IFLA_NET_NS_FD 28
 #endif
 
-static int veth_peer_info(struct net_link *link, struct newlink_req *req,
-						struct ns_id *ns, int ns_fd)
+static int veth_peer_info(struct net_link *link, struct newlink_req *req, struct ns_id *ns, int ns_fd)
 {
 	NetDeviceEntry *nde = link->nde;
 	char key[100], *val;
@@ -1233,7 +1465,7 @@ static int veth_peer_info(struct net_link *link, struct newlink_req *req,
 		return 0;
 	}
 out:
-	pr_err("Unknown peer net namespace");
+	pr_err("Unknown peer net namespace\n");
 	return -1;
 }
 
@@ -1251,7 +1483,17 @@ static int veth_link_info(struct ns_id *ns, struct net_link *link, struct newlin
 	peer_data = NLMSG_TAIL(&req->h);
 	memset(&ifm, 0, sizeof(ifm));
 
-	ifm.ifi_index = nde->peer_ifindex;
+	/*
+	 * Peer index might lay on the node root net namespace,
+	 * where the device index may be already borrowed by
+	 * some other device, so we should ignore it.
+	 *
+	 * Still if peer is laying in some other net-namespace,
+	 * we should recreate the device index as well as the
+	 * as we do for the master peer end.
+	 */
+	if (nde->has_peer_nsid)
+		ifm.ifi_index = nde->peer_ifindex;
 	addattr_l(&req->h, sizeof(*req), VETH_INFO_PEER, &ifm, sizeof(ifm));
 
 	veth_peer_info(link, req, ns, ns_fd);
@@ -1292,7 +1534,7 @@ static int changeflags(int s, char *name, short flags)
 {
 	struct ifreq ifr;
 
-	strlcpy(ifr.ifr_name, name, IFNAMSIZ);
+	__strlcpy(ifr.ifr_name, name, IFNAMSIZ);
 	ifr.ifr_flags = flags;
 
 	if (ioctl(s, SIOCSIFFLAGS, &ifr) < 0) {
@@ -1385,7 +1627,7 @@ static int restore_one_macvlan(struct ns_id *ns, struct net_link *link, int nlsk
 	 * CAP_NET_ADMIN is required in both namespaces, which we don't have in
 	 * the userns case, and usernsd doesn't exist in the non-userns case.
 	 */
-	extras.link = (int) (unsigned long) val;
+	extras.link = (int)(unsigned long)val;
 
 	my_netns = open_proc(PROC_SELF, "ns/net");
 	if (my_netns < 0)
@@ -1425,14 +1667,14 @@ static int sit_link_info(struct ns_id *ns, struct net_link *link, struct newlink
 	sit_data = NLMSG_TAIL(&req->h);
 	addattr_l(&req->h, sizeof(*req), IFLA_INFO_DATA, NULL, 0);
 
-#define DECODE_ENTRY(__type, __ifla, __proto) do {				\
-			__type aux;						\
-			if (se->has_##__proto) {				\
-				aux = se->__proto;				\
-				addattr_l(&req->h, sizeof(*req), __ifla,	\
-						&aux, sizeof(__type));		\
-			}							\
-		} while (0)
+#define DECODE_ENTRY(__type, __ifla, __proto)                                           \
+	do {                                                                            \
+		__type aux;                                                             \
+		if (se->has_##__proto) {                                                \
+			aux = se->__proto;                                              \
+			addattr_l(&req->h, sizeof(*req), __ifla, &aux, sizeof(__type)); \
+		}                                                                       \
+	} while (0)
 
 	if (se->n_local) {
 		if (se->n_local != 1) {
@@ -1450,18 +1692,18 @@ static int sit_link_info(struct ns_id *ns, struct net_link *link, struct newlink
 		addattr_l(&req->h, sizeof(*req), IFLA_IPTUN_REMOTE, se->remote, sizeof(u32));
 	}
 
-	DECODE_ENTRY(u32, IFLA_IPTUN_LINK,  link);
-	DECODE_ENTRY(u8,  IFLA_IPTUN_TTL,   ttl);
-	DECODE_ENTRY(u8,  IFLA_IPTUN_TOS,   tos);
+	DECODE_ENTRY(u32, IFLA_IPTUN_LINK, link);
+	DECODE_ENTRY(u8, IFLA_IPTUN_TTL, ttl);
+	DECODE_ENTRY(u8, IFLA_IPTUN_TOS, tos);
 	DECODE_ENTRY(u16, IFLA_IPTUN_FLAGS, flags);
-	DECODE_ENTRY(u8,  IFLA_IPTUN_PROTO, proto);
+	DECODE_ENTRY(u8, IFLA_IPTUN_PROTO, proto);
 
 	if (se->has_pmtudisc && se->pmtudisc) {
 		u8 aux = 1;
 		addattr_l(&req->h, sizeof(*req), IFLA_IPTUN_PMTUDISC, &aux, sizeof(u8));
 	}
 
-	DECODE_ENTRY(u16, IFLA_IPTUN_ENCAP_TYPE,  encap_type);
+	DECODE_ENTRY(u16, IFLA_IPTUN_ENCAP_TYPE, encap_type);
 	DECODE_ENTRY(u16, IFLA_IPTUN_ENCAP_FLAGS, encap_flags);
 	DECODE_ENTRY(u16, IFLA_IPTUN_ENCAP_SPORT, encap_sport);
 	DECODE_ENTRY(u16, IFLA_IPTUN_ENCAP_DPORT, encap_dport);
@@ -1489,7 +1731,7 @@ static int sit_link_info(struct ns_id *ns, struct net_link *link, struct newlink
 		aux = se->relay_prefixlen;
 		addattr_l(&req->h, sizeof(*req), IFLA_IPTUN_6RD_RELAY_PREFIXLEN, &aux, sizeof(u16));
 		addattr_l(&req->h, sizeof(*req), IFLA_IPTUN_6RD_RELAY_PREFIX, se->relay_prefix, sizeof(u32));
-skip:;
+	skip:;
 	}
 
 #undef DECODE_ENTRY
@@ -1502,19 +1744,26 @@ skip:;
 static int __restore_link(struct ns_id *ns, struct net_link *link, int nlsk)
 {
 	NetDeviceEntry *nde = link->nde;
+	char key[100], *val;
 
 	pr_info("Restoring link %s type %d\n", nde->name, nde->type);
 
 	switch (nde->type) {
 	case ND_TYPE__LOOPBACK: /* fallthrough */
-	case ND_TYPE__EXTLINK:  /* see comment in images/netdev.proto */
+	case ND_TYPE__EXTLINK:	/* see comment in images/netdev.proto */
 		return restore_link_parms(link, nlsk);
 	case ND_TYPE__VENET:
 		return restore_one_link(ns, link, nlsk, venet_link_info, NULL);
 	case ND_TYPE__VETH:
+		/* Handle pre-created veth devices we just need to move over. */
+		snprintf(key, sizeof(key), "netdev[%s]", nde->name);
+		val = external_lookup_by_key(key);
+		if (!IS_ERR_OR_NULL(val))
+			return move_veth(val, ns, link, nlsk);
+
 		return restore_one_link(ns, link, nlsk, veth_link_info, NULL);
 	case ND_TYPE__TUN:
-		return restore_one_tun(link, nlsk);
+		return restore_one_tun(ns, link, nlsk);
 	case ND_TYPE__BRIDGE:
 		return restore_one_link(ns, link, nlsk, bridge_link_info, NULL);
 	case ND_TYPE__MACVLAN:
@@ -1583,14 +1832,17 @@ static int restore_link(int nlsk, struct ns_id *ns, struct net_link *link)
 		def_netns = NULL;
 
 	if (nde->conf4)
-		ret = ipv4_conf_op(nde->name, nde->conf4, nde->n_conf4, CTL_WRITE, def_netns ? (*def_netns)->def_conf4 : NULL);
+		ret = ipv4_conf_op(nde->name, nde->conf4, nde->n_conf4, CTL_WRITE,
+				   def_netns ? (*def_netns)->def_conf4 : NULL);
 	else if (nde->conf)
-		ret = ipv4_conf_op_old(nde->name, nde->conf, nde->n_conf, CTL_WRITE, def_netns ? (*def_netns)->def_conf : NULL);
+		ret = ipv4_conf_op_old(nde->name, nde->conf, nde->n_conf, CTL_WRITE,
+				       def_netns ? (*def_netns)->def_conf : NULL);
 	if (ret)
 		goto exit;
 
 	if (nde->conf6)
-		ret = ipv6_conf_op(nde->name, nde->conf6, nde->n_conf6, CTL_WRITE, def_netns ? (*def_netns)->def_conf6 : NULL);
+		ret = ipv6_conf_op(nde->name, nde->conf6, nde->n_conf6, CTL_WRITE,
+				   def_netns ? (*def_netns)->def_conf6 : NULL);
 exit:
 	return ret;
 }
@@ -1602,15 +1854,14 @@ static int restore_master_link(int nlsk, struct ns_id *ns, struct net_link *link
 	memset(&req, 0, sizeof(req));
 
 	req.h.nlmsg_len = NLMSG_LENGTH(sizeof(struct ifinfomsg));
-	req.h.nlmsg_flags = NLM_F_REQUEST|NLM_F_ACK|NLM_F_CREATE;
+	req.h.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE;
 	req.h.nlmsg_type = RTM_SETLINK;
 	req.h.nlmsg_seq = CR_NLMSG_SEQ;
 	req.i.ifi_family = AF_PACKET;
 	req.i.ifi_index = link->nde->ifindex;
 	req.i.ifi_flags = link->nde->flags;
 
-	addattr_l(&req.h, sizeof(req), IFLA_MASTER,
-			&link->nde->master, sizeof(link->nde->master));
+	addattr_l(&req.h, sizeof(req), IFLA_MASTER, &link->nde->master, sizeof(link->nde->master));
 
 	return do_rtnl_req(nlsk, &req, req.h.nlmsg_len, restore_link_cb, NULL, NULL, NULL);
 }
@@ -1639,8 +1890,7 @@ static int __restore_links(struct ns_id *nsid, int *nrlinks, int *nrcreated)
 
 		(*nrlinks)++;
 
-		pr_debug("Try to restore a link %d:%d:%s",
-				nsid->id, link->nde->ifindex, link->nde->name);
+		pr_debug("Try to restore a link %d:%d:%s\n", nsid->id, link->nde->ifindex, link->nde->name);
 		if (link->nde->has_master) {
 			mlink = lookup_net_link(nsid, link->nde->master);
 			if (mlink == NULL) {
@@ -1649,8 +1899,8 @@ static int __restore_links(struct ns_id *nsid, int *nrlinks, int *nrcreated)
 			}
 
 			if (!mlink->created) {
-				pr_debug("The master %d:%d:%s isn't created yet",
-					nsid->id, mlink->nde->ifindex, mlink->nde->name);
+				pr_debug("The master %d:%d:%s isn't created yet", nsid->id, mlink->nde->ifindex,
+					 mlink->nde->name);
 				continue;
 			}
 		}
@@ -1671,7 +1921,7 @@ static int __restore_links(struct ns_id *nsid, int *nrlinks, int *nrcreated)
 	return 0;
 }
 
-static int restore_links()
+static int restore_links(void)
 {
 	int nrcreated, nrlinks;
 	struct ns_id *nsid;
@@ -1693,7 +1943,7 @@ static int restore_links()
 		if (nrcreated == nrlinks)
 			break;
 		if (nrcreated == 0) {
-			pr_err("Unable to restore network links");
+			pr_err("Unable to restore network links\n");
 			return -1;
 		}
 	}
@@ -1701,23 +1951,21 @@ static int restore_links()
 	return 0;
 }
 
-
 static int run_ip_tool(char *arg1, char *arg2, char *arg3, char *arg4, int fdin, int fdout, unsigned flags)
 {
 	char *ip_tool_cmd;
 	int ret;
 
-	pr_debug("\tRunning ip %s %s %s %s\n", arg1, arg2, arg3 ? : "\0", arg4 ? : "\0");
+	pr_debug("\tRunning ip %s %s %s %s\n", arg1, arg2, arg3 ?: "", arg4 ?: "");
 
 	ip_tool_cmd = getenv("CR_IP_TOOL");
 	if (!ip_tool_cmd)
 		ip_tool_cmd = "ip";
 
-	ret = cr_system(fdin, fdout, -1, ip_tool_cmd,
-				(char *[]) { "ip", arg1, arg2, arg3, arg4, NULL }, flags);
+	ret = cr_system(fdin, fdout, -1, ip_tool_cmd, (char *[]){ "ip", arg1, arg2, arg3, arg4, NULL }, flags);
 	if (ret) {
 		if (!(flags & CRS_CAN_FAIL))
-			pr_err("IP tool failed on %s %s %s %s\n", arg1, arg2, arg3 ? : "\0", arg4 ? : "\0");
+			pr_err("IP tool failed on %s %s %s %s\n", arg1, arg2, arg3 ?: "", arg4 ?: "");
 		return -1;
 	}
 
@@ -1733,7 +1981,7 @@ static int run_iptables_tool(char *def_cmd, int fdin, int fdout)
 	if (!cmd)
 		cmd = def_cmd;
 	pr_debug("\tRunning %s for %s\n", cmd, def_cmd);
-	ret = cr_system(fdin, fdout, -1, "sh", (char *[]) { "sh", "-c", cmd, NULL }, 0);
+	ret = cr_system(fdin, fdout, -1, "sh", (char *[]){ "sh", "-c", cmd, NULL }, 0);
 	if (ret)
 		pr_err("%s failed\n", def_cmd);
 
@@ -1789,19 +2037,95 @@ static inline int dump_rule(struct cr_imgset *fds)
 static inline int dump_iptables(struct cr_imgset *fds)
 {
 	struct cr_img *img;
+	char *iptables_cmd = "iptables-save";
+	char *ip6tables_cmd = "ip6tables-save";
 
-	img = img_from_set(fds, CR_FD_IPTABLES);
-	if (run_iptables_tool("iptables-save", -1, img_raw_fd(img)))
-		return -1;
+	/*
+	 * Let's skip iptables dump if we have nftables support compiled in,
+	 * and iptables backend is nft to prevent duplicate dumps.
+	 */
+#if defined(CONFIG_HAS_NFTABLES_LIB_API_0) || defined(CONFIG_HAS_NFTABLES_LIB_API_1)
+	iptables_cmd = get_legacy_iptables_bin(false, false);
 
-	if (kdat.ipv6) {
+	if (kdat.ipv6)
+		ip6tables_cmd = get_legacy_iptables_bin(true, false);
+#endif
+
+	if (!iptables_cmd) {
+		pr_info("skipping iptables dump - no legacy version present\n");
+	} else {
+		img = img_from_set(fds, CR_FD_IPTABLES);
+		if (run_iptables_tool(iptables_cmd, -1, img_raw_fd(img)))
+			return -1;
+	}
+
+	if (!kdat.ipv6)
+		return 0;
+
+	if (!ip6tables_cmd) {
+		pr_info("skipping ip6tables dump - no legacy version present\n");
+	} else {
 		img = img_from_set(fds, CR_FD_IP6TABLES);
-		if (run_iptables_tool("ip6tables-save", -1, img_raw_fd(img)))
+		if (run_iptables_tool(ip6tables_cmd, -1, img_raw_fd(img)))
 			return -1;
 	}
 
 	return 0;
 }
+
+#if defined(CONFIG_HAS_NFTABLES_LIB_API_0) || defined(CONFIG_HAS_NFTABLES_LIB_API_1)
+static inline int dump_nftables(struct cr_imgset *fds)
+{
+	int ret = -1;
+	struct cr_img *img;
+	int img_fd;
+	FILE *fp;
+	struct nft_ctx *nft;
+
+	nft = nft_ctx_new(NFT_CTX_DEFAULT);
+	if (!nft)
+		return -1;
+
+	img = img_from_set(fds, CR_FD_NFTABLES);
+	img_fd = img_raw_fd(img);
+	if (img_fd < 0) {
+		pr_err("Getting raw FD failed\n");
+		goto nft_ctx_free_out;
+	}
+	img_fd = dup(img_fd);
+	if (img_fd < 0) {
+		pr_perror("dup() failed");
+		goto nft_ctx_free_out;
+	}
+
+	fp = fdopen(img_fd, "w");
+	if (!fp) {
+		pr_perror("fdopen() failed");
+		close(img_fd);
+		goto nft_ctx_free_out;
+	}
+
+	nft_ctx_set_output(nft, fp);
+#define DUMP_NFTABLES_CMD "list ruleset"
+#if defined(CONFIG_HAS_NFTABLES_LIB_API_0)
+	if (nft_run_cmd_from_buffer(nft, DUMP_NFTABLES_CMD, strlen(DUMP_NFTABLES_CMD)))
+#elif defined(CONFIG_HAS_NFTABLES_LIB_API_1)
+	if (nft_run_cmd_from_buffer(nft, DUMP_NFTABLES_CMD))
+#else
+	BUILD_BUG_ON(1);
+#endif
+		goto fp_close_out;
+
+	ret = 0;
+
+fp_close_out:
+	fclose(fp);
+nft_ctx_free_out:
+	nft_ctx_free(nft);
+
+	return ret;
+}
+#endif
 
 static int dump_netns_conf(struct ns_id *ns, struct cr_imgset *fds)
 {
@@ -1809,28 +2133,29 @@ static int dump_netns_conf(struct ns_id *ns, struct cr_imgset *fds)
 	int ret = -1;
 	int i;
 	NetnsEntry netns = NETNS_ENTRY__INIT;
+	SysctlEntry *unix_confs = NULL;
+	size_t sizex = ARRAY_SIZE(unix_conf_entries);
 	SysctlEntry *def_confs4 = NULL, *all_confs4 = NULL;
 	int size4 = ARRAY_SIZE(devconfs4);
 	SysctlEntry *def_confs6 = NULL, *all_confs6 = NULL;
 	int size6 = ARRAY_SIZE(devconfs6);
 	char def_stable_secret[MAX_STR_CONF_LEN + 1] = {};
 	char all_stable_secret[MAX_STR_CONF_LEN + 1] = {};
-	NetnsId	*ids;
+	NetnsId *ids;
 	struct netns_id *p;
 
 	i = 0;
 	list_for_each_entry(p, &ns->net.ids, node)
 		i++;
 
-	o_buf = buf = xmalloc(
-			i * (sizeof(NetnsId*) + sizeof(NetnsId)) +
-			size4 * (sizeof(SysctlEntry*) + sizeof(SysctlEntry)) * 2 +
-			size6 * (sizeof(SysctlEntry*) + sizeof(SysctlEntry)) * 2
-		     );
+	o_buf = buf = xmalloc(i * (sizeof(NetnsId *) + sizeof(NetnsId)) +
+			      size4 * (sizeof(SysctlEntry *) + sizeof(SysctlEntry)) * 2 +
+			      size6 * (sizeof(SysctlEntry *) + sizeof(SysctlEntry)) * 2 +
+			      sizex * (sizeof(SysctlEntry *) + sizeof(SysctlEntry)));
 	if (!buf)
 		goto out;
 
-	netns.nsids = xptr_pull_s(&buf, i * sizeof(NetnsId*));
+	netns.nsids = xptr_pull_s(&buf, i * sizeof(NetnsId *));
 	ids = xptr_pull_s(&buf, i * sizeof(NetnsId));
 	i = 0;
 	list_for_each_entry(p, &ns->net.ids, node) {
@@ -1844,8 +2169,8 @@ static int dump_netns_conf(struct ns_id *ns, struct cr_imgset *fds)
 
 	netns.n_def_conf4 = size4;
 	netns.n_all_conf4 = size4;
-	netns.def_conf4 = xptr_pull_s(&buf, size4 * sizeof(SysctlEntry*));
-	netns.all_conf4 = xptr_pull_s(&buf, size4 * sizeof(SysctlEntry*));
+	netns.def_conf4 = xptr_pull_s(&buf, size4 * sizeof(SysctlEntry *));
+	netns.all_conf4 = xptr_pull_s(&buf, size4 * sizeof(SysctlEntry *));
 	def_confs4 = xptr_pull_s(&buf, size4 * sizeof(SysctlEntry));
 	all_confs4 = xptr_pull_s(&buf, size4 * sizeof(SysctlEntry));
 
@@ -1860,8 +2185,8 @@ static int dump_netns_conf(struct ns_id *ns, struct cr_imgset *fds)
 
 	netns.n_def_conf6 = size6;
 	netns.n_all_conf6 = size6;
-	netns.def_conf6 = xptr_pull_s(&buf, size6 * sizeof(SysctlEntry*));
-	netns.all_conf6 = xptr_pull_s(&buf, size6 * sizeof(SysctlEntry*));
+	netns.def_conf6 = xptr_pull_s(&buf, size6 * sizeof(SysctlEntry *));
+	netns.all_conf6 = xptr_pull_s(&buf, size6 * sizeof(SysctlEntry *));
 	def_confs6 = xptr_pull_s(&buf, size6 * sizeof(SysctlEntry));
 	all_confs6 = xptr_pull_s(&buf, size6 * sizeof(SysctlEntry));
 
@@ -1881,6 +2206,16 @@ static int dump_netns_conf(struct ns_id *ns, struct cr_imgset *fds)
 		}
 	}
 
+	netns.n_unix_conf = sizex;
+	netns.unix_conf = xptr_pull_s(&buf, sizex * sizeof(SysctlEntry *));
+	unix_confs = xptr_pull_s(&buf, sizex * sizeof(SysctlEntry));
+
+	for (i = 0; i < sizex; i++) {
+		sysctl_entry__init(&unix_confs[i]);
+		netns.unix_conf[i] = &unix_confs[i];
+		netns.unix_conf[i]->type = SYSCTL_TYPE__CTL_32;
+	}
+
 	ret = ipv4_conf_op("default", netns.def_conf4, size4, CTL_READ, NULL);
 	if (ret < 0)
 		goto err_free;
@@ -1895,6 +2230,10 @@ static int dump_netns_conf(struct ns_id *ns, struct cr_imgset *fds)
 	if (ret < 0)
 		goto err_free;
 
+	ret = unix_conf_op(&netns.unix_conf, &netns.n_unix_conf, CTL_READ);
+	if (ret < 0)
+		goto err_free;
+
 	ret = pb_write_one(img_from_set(fds, CR_FD_NETNS), &netns, PB_NETNS);
 err_free:
 	xfree(o_buf);
@@ -1904,18 +2243,60 @@ out:
 
 static int restore_ip_dump(int type, int pid, char *cmd)
 {
-	int ret = -1;
+	int ret = -1, sockfd, n, written;
+	FILE *tmp_file;
 	struct cr_img *img;
+	char buf[1024];
 
 	img = open_image(type, O_RSTR, pid);
 	if (empty_image(img)) {
 		close_image(img);
 		return 0;
 	}
-	if (img) {
-		ret = run_ip_tool(cmd, "restore", NULL, NULL, img_raw_fd(img), -1, 0);
-		close_image(img);
+	sockfd = img_raw_fd(img);
+	if (sockfd < 0) {
+		pr_err("Getting raw FD failed\n");
+		goto out_image;
 	}
+	tmp_file = tmpfile();
+	if (!tmp_file) {
+		pr_perror("Failed to open tmpfile");
+		goto out_image;
+	}
+
+	while ((n = read(sockfd, buf, 1024)) > 0) {
+		written = fwrite(buf, sizeof(char), n, tmp_file);
+		if (written < n) {
+			pr_perror("Failed to write to tmpfile "
+				  "[written: %d; total: %d]",
+				  written, n);
+			goto out_tmp_file;
+		}
+	}
+
+	if (fseek(tmp_file, 0, SEEK_SET)) {
+		pr_perror("Failed to set file position to beginning of tmpfile");
+		goto out_tmp_file;
+	}
+
+	if (type == CR_FD_RULE) {
+		/*
+		 * Delete 3 default rules to prevent duplicates. See kernel's
+		 * function fib_default_rules_init() for the details.
+		 */
+		run_ip_tool("rule", "flush", NULL, NULL, -1, -1, 0);
+		run_ip_tool("rule", "delete", "table", "local", -1, -1, 0);
+	}
+
+	ret = run_ip_tool(cmd, "restore", NULL, NULL, fileno(tmp_file), -1, 0);
+
+out_tmp_file:
+	if (fclose(tmp_file)) {
+		pr_perror("Failed to close tmpfile");
+	}
+
+out_image:
+	close_image(img);
 
 	return ret;
 }
@@ -1938,38 +2319,14 @@ static inline int restore_route(int pid)
 
 static inline int restore_rule(int pid)
 {
-	struct cr_img *img;
-	int ret = 0;
-
-	img = open_image(CR_FD_RULE, O_RSTR, pid);
-	if (!img) {
-		ret = -1;
-		goto out;
-	}
-
-	if (empty_image(img))
-		goto close;
-
-	/*
-	 * Delete 3 default rules to prevent duplicates. See kernel's
-	 * function fib_default_rules_init() for the details.
-	 */
-	run_ip_tool("rule", "flush",  NULL,    NULL,    -1, -1, 0);
-	run_ip_tool("rule", "delete", "table", "local", -1, -1, 0);
-
-	if (restore_ip_dump(CR_FD_RULE, pid, "rule"))
-		ret = -1;
-close:
-	close_image(img);
-out:
-	return ret;
+	return restore_ip_dump(CR_FD_RULE, pid, "rule");
 }
 
 /*
  * iptables-restore is executed from a target userns and it may have not enough
  * rights to open /run/xtables.lock. Here we try to workaround this problem.
  */
-static int prepare_xtable_lock()
+static int prepare_xtable_lock(void)
 {
 	int fd;
 
@@ -1988,8 +2345,8 @@ static int prepare_xtable_lock()
 		return -1;
 	}
 
-	if (mount(NULL, "/",  NULL, MS_SLAVE | MS_REC, NULL)) {
-		pr_perror("Unable to conver mounts to slave mounts");
+	if (mount(NULL, "/", NULL, MS_SLAVE | MS_REC, NULL)) {
+		pr_perror("Unable to convert mounts to slave mounts");
 		return -1;
 	}
 	/*
@@ -2009,18 +2366,41 @@ static int prepare_xtable_lock()
 
 static inline int restore_iptables(int pid)
 {
+	char *iptables_cmd = "iptables-restore";
+	char *ip6tables_cmd = "ip6tables-restore";
+	char comm[32];
 	int ret = -1;
 	struct cr_img *img;
+
+#if defined(CONFIG_HAS_NFTABLES_LIB_API_0) || defined(CONFIG_HAS_NFTABLES_LIB_API_1)
+	iptables_cmd = get_legacy_iptables_bin(false, true);
+
+	if (kdat.ipv6)
+		ip6tables_cmd = get_legacy_iptables_bin(true, true);
+#endif
 
 	img = open_image(CR_FD_IPTABLES, O_RSTR, pid);
 	if (img == NULL)
 		return -1;
 	if (empty_image(img)) {
 		ret = 0;
+		close_image(img);
 		goto ipt6;
 	}
 
-	ret = run_iptables_tool("iptables-restore -w", img_raw_fd(img), -1);
+	if (!iptables_cmd) {
+		pr_err("Can't restore iptables dump - no legacy version present\n");
+		close_image(img);
+		return -1;
+	}
+
+	if (snprintf(comm, sizeof(comm), "%s -w", iptables_cmd) >= sizeof(comm)) {
+		pr_err("Can't fit '%s -w' to buffer\n", iptables_cmd);
+		close_image(img);
+		return -1;
+	}
+
+	ret = run_iptables_tool(comm, img_raw_fd(img), -1);
 	close_image(img);
 	if (ret)
 		return ret;
@@ -2031,32 +2411,138 @@ ipt6:
 	if (empty_image(img))
 		goto out;
 
-	ret = run_iptables_tool("ip6tables-restore -w", img_raw_fd(img), -1);
+	if (!ip6tables_cmd) {
+		pr_err("Can't restore ip6tables dump - no legacy version present\n");
+		close_image(img);
+		return -1;
+	}
+
+	if (snprintf(comm, sizeof(comm), "%s -w", ip6tables_cmd) >= sizeof(comm)) {
+		pr_err("Can't fit '%s -w' to buffer\n", ip6tables_cmd);
+		close_image(img);
+		return -1;
+	}
+
+	ret = run_iptables_tool(comm, img_raw_fd(img), -1);
 out:
 	close_image(img);
 
 	return ret;
 }
 
-static int restore_netns_conf(struct ns_id *ns)
+#if defined(CONFIG_HAS_NFTABLES_LIB_API_0) || defined(CONFIG_HAS_NFTABLES_LIB_API_1)
+static inline int do_restore_nftables(struct cr_img *img)
 {
-	NetnsEntry *netns;
-	int ret = 0;
-	struct cr_img *img;
+	int exit_code = -1;
+	struct nft_ctx *nft;
+	off_t img_data_size;
+	char *buf;
 
-	img = open_image(CR_FD_NETNS, O_RSTR, ns->id);
-	if (!img)
-		return -1;
-
-	if (empty_image(img))
-		/* Backward compatibility */
+	if ((img_data_size = img_raw_size(img)) < 0)
 		goto out;
 
-	ret = pb_read_one(img, &netns, PB_NETNS);
-	if (ret < 0) {
-		pr_err("Can not read netns object\n");
-		return -1;
+	if (read_img_str(img, &buf, img_data_size) < 0)
+		goto out;
+
+	nft = nft_ctx_new(NFT_CTX_DEFAULT);
+	if (!nft)
+		goto buf_free_out;
+
+	if (nft_ctx_buffer_output(nft) || nft_ctx_buffer_error(nft) ||
+#if defined(CONFIG_HAS_NFTABLES_LIB_API_0)
+	    nft_run_cmd_from_buffer(nft, buf, strlen(buf)))
+#elif defined(CONFIG_HAS_NFTABLES_LIB_API_1)
+	    nft_run_cmd_from_buffer(nft, buf))
+#else
+	{
+		BUILD_BUG_ON(1);
 	}
+#endif
+		goto nft_ctx_free_out;
+
+	exit_code = 0;
+
+nft_ctx_free_out:
+	nft_ctx_free(nft);
+buf_free_out:
+	xfree(buf);
+out:
+	return exit_code;
+}
+#endif
+
+static inline int restore_nftables(int pid)
+{
+	int exit_code = -1;
+	struct cr_img *img;
+
+	img = open_image(CR_FD_NFTABLES, O_RSTR, pid);
+	if (img == NULL)
+		return -1;
+	if (empty_image(img)) {
+		/* Backward compatibility */
+		pr_info("Skipping nft restore, no image\n");
+		exit_code = 0;
+		goto image_close_out;
+	}
+
+#if defined(CONFIG_HAS_NFTABLES_LIB_API_0) || defined(CONFIG_HAS_NFTABLES_LIB_API_1)
+	if (!do_restore_nftables(img))
+		exit_code = 0;
+#else
+	pr_err("Unable to restore nftables. CRIU was built without libnftables support\n");
+#endif
+
+image_close_out:
+	close_image(img);
+
+	return exit_code;
+}
+
+int read_net_ns_img(void)
+{
+	struct ns_id *ns;
+
+	if (!(root_ns_mask & CLONE_NEWNET))
+		return 0;
+
+	for (ns = ns_ids; ns != NULL; ns = ns->next) {
+		struct cr_img *img;
+		int ret;
+
+		if (ns->nd != &net_ns_desc)
+			continue;
+
+		img = open_image(CR_FD_NETNS, O_RSTR, ns->id);
+		if (!img)
+			return -1;
+
+		if (empty_image(img)) {
+			/* Backward compatibility */
+			close_image(img);
+			continue;
+		}
+
+		ret = pb_read_one(img, &ns->net.netns, PB_NETNS);
+		close_image(img);
+		if (ret < 0) {
+			pr_err("Can not read netns object\n");
+			return -1;
+		}
+		ns->ext_key = ns->net.netns->ext_key;
+	}
+
+	return 0;
+}
+
+static int restore_netns_conf(struct ns_id *ns)
+{
+	NetnsEntry *netns = ns->net.netns;
+	int ret = 0;
+
+	if (ns->net.netns == NULL)
+		/* Backward compatibility */
+		goto out;
 
 	if ((netns)->def_conf4) {
 		ret = ipv4_conf_op("all", (netns)->all_conf4, (netns)->n_all_conf4, CTL_WRITE, NULL);
@@ -2082,9 +2568,14 @@ static int restore_netns_conf(struct ns_id *ns)
 		ret = ipv6_conf_op("default", (netns)->def_conf6, (netns)->n_def_conf6, CTL_WRITE, NULL);
 	}
 
+	if ((netns)->unix_conf) {
+		ret = unix_conf_op(&(netns)->unix_conf, &(netns)->n_unix_conf, CTL_WRITE);
+		if (ret)
+			goto out;
+	}
+
 	ns->net.netns = netns;
 out:
-	close_image(img);
 	return ret;
 }
 
@@ -2093,6 +2584,11 @@ static int mount_ns_sysfs(void)
 	char sys_mount[] = "crtools-sys.XXXXXX";
 
 	BUG_ON(ns_sysfs_fd != -1);
+
+	if (kdat.has_fsopen) {
+		ns_sysfs_fd = mount_detached_fs("sysfs");
+		return ns_sysfs_fd >= 0 ? 0 : -1;
+	}
 
 	/*
 	 * A new mntns is required to avoid the race between
@@ -2149,7 +2645,7 @@ static int collect_netns_id(struct ns_id *ns, void *oarg)
 	if (!netns_id)
 		return -1;
 
-	pr_debug("Fount the %d id for %d in %d\n", nsid, ns->id, arg->ns->id);
+	pr_debug("Found the %d id for %d in %d\n", nsid, ns->id, arg->ns->id);
 	netns_id->target_ns_id = ns->id;
 	netns_id->netnsid_value = nsid;
 
@@ -2164,8 +2660,23 @@ static int dump_netns_ids(int rtsk, struct ns_id *ns)
 		.ns = ns,
 		.sk = rtsk,
 	};
-	return walk_namespaces(&net_ns_desc, collect_netns_id,
-			(void *)&arg);
+	return walk_namespaces(&net_ns_desc, collect_netns_id, (void *)&arg);
+}
+
+int net_set_ext(struct ns_id *ns)
+{
+	int fd, ret;
+
+	fd = inherit_fd_lookup_id(ns->ext_key);
+	if (fd < 0) {
+		pr_err("Unable to find an external netns: %s\n", ns->ext_key);
+		return -1;
+	}
+
+	ret = switch_ns_by_fd(fd, &net_ns_desc, NULL);
+	close(fd);
+
+	return ret;
 }
 
 int dump_net_ns(struct ns_id *ns)
@@ -2178,7 +2689,14 @@ int dump_net_ns(struct ns_id *ns)
 		return -1;
 
 	ret = mount_ns_sysfs();
-	if (!(opts.empty_ns & CLONE_NEWNET)) {
+	if (ns->ext_key) {
+		NetnsEntry netns = NETNS_ENTRY__INIT;
+
+		netns.ext_key = ns->ext_key;
+		ret = pb_write_one(img_from_set(fds, CR_FD_NETNS), &netns, PB_NETNS);
+		if (ret)
+			goto out;
+	} else if (!(opts.empty_ns & CLONE_NEWNET)) {
 		int sk;
 
 		sk = socket(PF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
@@ -2201,7 +2719,7 @@ int dump_net_ns(struct ns_id *ns)
 		if (!ret)
 			ret = dump_links(sk, ns, fds);
 
-		close(sk);
+		close_safe(&sk);
 
 		if (!ret)
 			ret = dump_ifaddr(fds);
@@ -2211,6 +2729,10 @@ int dump_net_ns(struct ns_id *ns)
 			ret = dump_rule(fds);
 		if (!ret)
 			ret = dump_iptables(fds);
+#if defined(CONFIG_HAS_NFTABLES_LIB_API_0) || defined(CONFIG_HAS_NFTABLES_LIB_API_1)
+		if (!ret)
+			ret = dump_nftables(fds);
+#endif
 		if (!ret)
 			ret = dump_netns_conf(ns, fds);
 	} else if (ns->type != NS_ROOT) {
@@ -2222,6 +2744,7 @@ int dump_net_ns(struct ns_id *ns)
 	if (!ret)
 		ret = dump_nf_ct(fds, CR_FD_NETNF_EXP);
 
+out:
 	close(ns_sysfs_fd);
 	ns_sysfs_fd = -1;
 
@@ -2275,7 +2798,7 @@ static int prepare_net_ns_first_stage(struct ns_id *ns)
 {
 	int ret = 0;
 
-	if (opts.empty_ns & CLONE_NEWNET)
+	if (ns->ext_key || (opts.empty_ns & CLONE_NEWNET))
 		return 0;
 
 	ret = restore_netns_conf(ns);
@@ -2291,7 +2814,7 @@ static int prepare_net_ns_second_stage(struct ns_id *ns)
 {
 	int ret = 0, nsid = ns->id;
 
-	if (!(opts.empty_ns & CLONE_NEWNET)) {
+	if (!(opts.empty_ns & CLONE_NEWNET) && !ns->ext_key) {
 		if (ns->net.netns)
 			netns_entry__free_unpacked(ns->net.netns, NULL);
 
@@ -2303,6 +2826,8 @@ static int prepare_net_ns_second_stage(struct ns_id *ns)
 			ret = restore_rule(nsid);
 		if (!ret)
 			ret = restore_iptables(nsid);
+		if (!ret)
+			ret = restore_nftables(nsid);
 	}
 
 	if (!ret)
@@ -2339,7 +2864,14 @@ static int open_net_ns(struct ns_id *nsid)
 
 static int do_create_net_ns(struct ns_id *ns)
 {
-	if (unshare(CLONE_NEWNET)) {
+	int ret;
+
+	if (ns->ext_key)
+		ret = net_set_ext(ns);
+	else
+		ret = unshare(CLONE_NEWNET);
+
+	if (ret) {
 		pr_perror("Unable to create a new netns");
 		return -1;
 	}
@@ -2388,7 +2920,6 @@ static int __prepare_net_namespaces(void *unused)
 			pr_perror("Can't create nlk socket");
 			goto err;
 		}
-
 	}
 
 	if (restore_links())
@@ -2413,7 +2944,6 @@ static int __prepare_net_namespaces(void *unused)
 err:
 	return -1;
 }
-
 
 int prepare_net_namespaces(void)
 {
@@ -2487,13 +3017,12 @@ int netns_keep_nsfd(void)
 		pr_err("Can't install ns net reference\n");
 	else
 		pr_info("Saved netns fd for links restore\n");
-	close(ns_fd);
 
 	return ret >= 0 ? 0 : -1;
 }
 
 /*
- * If we want to modify iptables, we need to recevied the current
+ * If we want to modify iptables, we need to received the current
  * configuration, change it and load a new one into the kernel.
  * iptables can change or add only one rule.
  * iptables-restore allows to make a few changes for one iteration,
@@ -2502,8 +3031,8 @@ int netns_keep_nsfd(void)
 static int iptables_restore(bool ipv6, char *buf, int size)
 {
 	int pfd[2], ret = -1;
-	char *cmd4[] = {"iptables-restore", "-w", "--noflush", NULL};
-	char *cmd6[] = {"ip6tables-restore", "-w", "--noflush", NULL};
+	char *cmd4[] = { "iptables-restore", "-w", "--noflush", NULL };
+	char *cmd6[] = { "ip6tables-restore", "-w", "--noflush", NULL };
 	char **cmd = ipv6 ? cmd6 : cmd4;
 
 	if (pipe(pfd) < 0) {
@@ -2524,20 +3053,68 @@ err:
 	return ret;
 }
 
-int network_lock_internal()
+static inline int nftables_lock_network_internal(void)
 {
-	char conf[] =	"*filter\n"
-				":CRIU - [0:0]\n"
-				"-I INPUT -j CRIU\n"
-				"-I OUTPUT -j CRIU\n"
-				"-A CRIU -m mark --mark " __stringify(SOCCR_MARK) " -j ACCEPT\n"
-				"-A CRIU -j DROP\n"
-				"COMMIT\n";
-	int ret = 0, nsret;
+#if defined(CONFIG_HAS_NFTABLES_LIB_API_0) || defined(CONFIG_HAS_NFTABLES_LIB_API_1)
+	struct nft_ctx *nft;
+	int ret = 0;
+	char table[32];
+	char buf[128];
 
-	if (switch_ns(root_item->pid->real, &net_ns_desc, &nsret))
+	if (nftables_get_table(table, sizeof(table)))
 		return -1;
 
+	nft = nft_ctx_new(NFT_CTX_DEFAULT);
+	if (!nft)
+		return -1;
+
+	snprintf(buf, sizeof(buf), "create table %s", table);
+	if (NFT_RUN_CMD(nft, buf))
+		goto err2;
+
+	snprintf(buf, sizeof(buf), "add chain %s output { type filter hook output priority 0; policy drop; }", table);
+	if (NFT_RUN_CMD(nft, buf))
+		goto err1;
+
+	snprintf(buf, sizeof(buf), "add rule %s output meta mark " __stringify(SOCCR_MARK) " accept", table);
+	if (NFT_RUN_CMD(nft, buf))
+		goto err1;
+
+	snprintf(buf, sizeof(buf), "add chain %s input { type filter hook input priority 0; policy drop; }", table);
+	if (NFT_RUN_CMD(nft, buf))
+		goto err1;
+
+	snprintf(buf, sizeof(buf), "add rule %s input meta mark " __stringify(SOCCR_MARK) " accept", table);
+	if (NFT_RUN_CMD(nft, buf))
+		goto err1;
+
+	goto out;
+
+err1:
+	snprintf(buf, sizeof(buf), "delete table %s", table);
+	NFT_RUN_CMD(nft, buf);
+err2:
+	ret = -1;
+	pr_err("Locking network failed using nftables\n");
+out:
+	nft_ctx_free(nft);
+	return ret;
+#else
+	pr_err("CRIU was built without libnftables support\n");
+	return -1;
+#endif
+}
+
+static int iptables_network_lock_internal(void)
+{
+	char conf[] = "*filter\n"
+		      ":CRIU - [0:0]\n"
+		      "-I INPUT -j CRIU\n"
+		      "-I OUTPUT -j CRIU\n"
+		      "-A CRIU -m mark --mark " __stringify(SOCCR_MARK) " -j ACCEPT\n"
+									"-A CRIU -j DROP\n"
+									"COMMIT\n";
+	int ret = 0;
 
 	ret |= iptables_restore(false, conf, sizeof(conf) - 1);
 	if (kdat.ipv6)
@@ -2545,9 +3122,28 @@ int network_lock_internal()
 
 	if (ret)
 		pr_err("Locking network failed: iptables-restore returned %d. "
-			"This may be connected to disabled "
-			"CONFIG_NETFILTER_XT_MARK kernel build config "
-			"option.\n", ret);
+		       "This may be connected to disabled "
+		       "CONFIG_NETFILTER_XT_MARK kernel build config "
+		       "option.\n",
+		       ret);
+
+	return ret;
+}
+
+int network_lock_internal(void)
+{
+	int ret = 0, nsret;
+
+	if (opts.network_lock_method == NETWORK_LOCK_SKIP)
+		return 0;
+
+	if (switch_ns(root_item->pid->real, &net_ns_desc, &nsret))
+		return -1;
+
+	if (opts.network_lock_method == NETWORK_LOCK_IPTABLES)
+		ret = iptables_network_lock_internal();
+	else if (opts.network_lock_method == NETWORK_LOCK_NFTABLES)
+		ret = nftables_lock_network_internal();
 
 	if (restore_ns(nsret, &net_ns_desc))
 		ret = -1;
@@ -2555,23 +3151,64 @@ int network_lock_internal()
 	return ret;
 }
 
-static int network_unlock_internal()
+static inline int nftables_network_unlock(void)
 {
-	char conf[] =	"*filter\n"
-			":CRIU - [0:0]\n"
-			"-D INPUT -j CRIU\n"
-			"-D OUTPUT -j CRIU\n"
-			"-X CRIU\n"
-			"COMMIT\n";
-	int ret = 0, nsret;
+#if defined(CONFIG_HAS_NFTABLES_LIB_API_0) || defined(CONFIG_HAS_NFTABLES_LIB_API_1)
+	int ret = 0;
+	struct nft_ctx *nft;
+	char table[32];
+	char buf[128];
 
-	if (switch_ns(root_item->pid->real, &net_ns_desc, &nsret))
+	if (nftables_get_table(table, sizeof(table)))
 		return -1;
 
+	nft = nft_ctx_new(NFT_CTX_DEFAULT);
+	if (!nft)
+		return -1;
+
+	snprintf(buf, sizeof(buf), "delete table %s", table);
+	if (NFT_RUN_CMD(nft, buf))
+		ret = -1;
+
+	nft_ctx_free(nft);
+	return ret;
+#else
+	pr_err("CRIU was built without libnftables support\n");
+	return -1;
+#endif
+}
+
+static int iptables_network_unlock_internal(void)
+{
+	char conf[] = "*filter\n"
+		      ":CRIU - [0:0]\n"
+		      "-D INPUT -j CRIU\n"
+		      "-D OUTPUT -j CRIU\n"
+		      "-X CRIU\n"
+		      "COMMIT\n";
+	int ret = 0;
 
 	ret |= iptables_restore(false, conf, sizeof(conf) - 1);
 	if (kdat.ipv6)
 		ret |= iptables_restore(true, conf, sizeof(conf) - 1);
+
+	return ret;
+}
+
+static int network_unlock_internal(void)
+{
+	int ret = 0, nsret;
+
+	if (opts.network_lock_method == NETWORK_LOCK_SKIP)
+		return 0;
+
+	if (switch_ns(root_item->pid->real, &net_ns_desc, &nsret))
+		return -1;
+
+	if (opts.network_lock_method == NETWORK_LOCK_IPTABLES)
+		ret = iptables_network_unlock_internal();
+	else if (opts.network_lock_method == NETWORK_LOCK_NFTABLES)
+		ret = nftables_network_unlock();
 
 	if (restore_ns(nsret, &net_ns_desc))
 		ret = -1;
@@ -2584,8 +3221,11 @@ int network_lock(void)
 	pr_info("Lock network\n");
 
 	/* Each connection will be locked on dump */
-	if  (!(root_ns_mask & CLONE_NEWNET))
+	if (!(root_ns_mask & CLONE_NEWNET)) {
+		if (opts.network_lock_method == NETWORK_LOCK_NFTABLES)
+			nftables_init_connection_lock();
 		return 0;
+	}
 
 	if (run_scripts(ACT_NET_LOCK))
 		return -1;
@@ -2601,14 +3241,17 @@ void network_unlock(void)
 	rst_unlock_tcp_connections();
 
 	if (root_ns_mask & CLONE_NEWNET) {
+		/* coverity[check_return] */
 		run_scripts(ACT_NET_UNLOCK);
 		network_unlock_internal();
+	} else if (opts.network_lock_method == NETWORK_LOCK_NFTABLES) {
+		nftables_network_unlock();
 	}
 }
 
 int veth_pair_add(char *in, char *out)
 {
-	char *e_str;
+	cleanup_free char *e_str = NULL;
 
 	e_str = xmalloc(200); /* For 3 IFNAMSIZ + 8 service characters */
 	if (!e_str)
@@ -2619,7 +3262,7 @@ int veth_pair_add(char *in, char *out)
 
 int macvlan_ext_add(struct external *ext)
 {
-	ext->data = (void *) (unsigned long) if_nametoindex(external_val(ext));
+	ext->data = (void *)(unsigned long)if_nametoindex(external_val(ext));
 	if (ext->data == 0) {
 		pr_perror("can't get ifindex of %s", ext->id);
 		return -1;
@@ -2631,7 +3274,7 @@ int macvlan_ext_add(struct external *ext)
 /*
  * The setns() syscall (called by switch_ns()) can be extremely
  * slow. If we call it two or more times from the same task the
- * kernel will synchonously go on a very slow routine called
+ * kernel will synchronously go on a very slow routine called
  * synchronize_rcu() trying to put a reference on old namespaces.
  *
  * To avoid doing this more than once we pre-create all the
@@ -2641,6 +3284,9 @@ int macvlan_ext_add(struct external *ext)
 static int prep_ns_sockets(struct ns_id *ns, bool for_dump)
 {
 	int nsret = -1, ret;
+#ifdef CONFIG_HAS_SELINUX
+	char *ctx;
+#endif
 
 	if (ns->type != NS_CRIU) {
 		pr_info("Switching to %d's net for collecting sockets\n", ns->ns_pid);
@@ -2657,6 +3303,51 @@ static int prep_ns_sockets(struct ns_id *ns, bool for_dump)
 	} else
 		ns->net.nlsk = -1;
 
+#ifdef CONFIG_HAS_SELINUX
+	/*
+	 * If running on a system with SELinux enabled the socket for the
+	 * communication between parasite daemon and the main
+	 * CRIU process needs to be correctly labeled.
+	 * Initially this was motivated by Podman's use case: The container
+	 * is usually running as something like '...:...:container_t:...:....'
+	 * and CRIU started from runc and Podman will run as
+	 * '...:...:container_runtime_t:...:...'. As the parasite will be
+	 * running with the same context as the container process: 'container_t'.
+	 * Allowing a container process to connect via socket to the outside
+	 * of the container ('container_runtime_t') is not desired and
+	 * therefore CRIU needs to label the socket with the context of
+	 * the container: 'container_t'.
+	 * So this first gets the context of the root container process
+	 * and tells SELinux to label the next created socket with
+	 * the same label as the root container process.
+	 * For this to work it is necessary to have the correct SELinux
+	 * policies installed. For Fedora based systems this is part
+	 * of the container-selinux package.
+	 */
+
+	/*
+	 * This assumes that all processes CRIU wants to dump are labeled
+	 * with the same SELinux context. If some of the child processes
+	 * have different labels this will not work and needs additional
+	 * SELinux policies. But the whole SELinux socket labeling relies
+	 * on the correct SELinux being available.
+	 */
+	if (kdat.lsm == LSMTYPE__SELINUX) {
+		ret = getpidcon_raw(root_item->pid->real, &ctx);
+		if (ret < 0) {
+			pr_perror("Getting SELinux context for PID %d failed", root_item->pid->real);
+			goto err_sq;
+		}
+
+		ret = setsockcreatecon(ctx);
+		freecon(ctx);
+		if (ret < 0) {
+			pr_perror("Setting SELinux socket context for PID %d failed", root_item->pid->real);
+			goto err_sq;
+		}
+	}
+#endif
+
 	ret = ns->net.seqsk = socket(PF_UNIX, SOCK_SEQPACKET | SOCK_NONBLOCK, 0);
 	if (ret < 0) {
 		pr_perror("Can't create seqsk for parasite");
@@ -2664,6 +3355,23 @@ static int prep_ns_sockets(struct ns_id *ns, bool for_dump)
 	}
 
 	ret = 0;
+
+#ifdef CONFIG_HAS_SELINUX
+	/*
+	 * Once the socket has been created, reset the SELinux socket labelling
+	 * back to the default value of this process.
+	 */
+	if (kdat.lsm == LSMTYPE__SELINUX) {
+		ret = setsockcreatecon_raw(NULL);
+		if (ret < 0) {
+			pr_perror("Resetting SELinux socket context to "
+				  "default for PID %d failed",
+				  root_item->pid->real);
+			goto err_ret;
+		}
+	}
+#endif
+
 out:
 	if (nsret >= 0 && restore_ns(nsret, &net_ns_desc) < 0) {
 		nsret = -1;
@@ -2686,9 +3394,18 @@ static int netns_nr;
 static int collect_net_ns(struct ns_id *ns, void *oarg)
 {
 	bool for_dump = (oarg == (void *)1);
+	char id[64], *val;
 	int ret;
 
 	pr_info("Collecting netns %d/%d\n", ns->id, ns->ns_pid);
+
+	snprintf(id, sizeof(id), "net[%u]", ns->kid);
+	val = external_lookup_by_key(id);
+	if (!IS_ERR_OR_NULL(val)) {
+		pr_debug("The %s netns is external\n", id);
+		ns->ext_key = val;
+	}
+
 	ret = prep_ns_sockets(ns, for_dump);
 	if (ret)
 		return ret;
@@ -2703,13 +3420,12 @@ static int collect_net_ns(struct ns_id *ns, void *oarg)
 
 int collect_net_namespaces(bool for_dump)
 {
-	return walk_namespaces(&net_ns_desc, collect_net_ns,
-			(void *)(for_dump ? 1UL : 0));
+	return walk_namespaces(&net_ns_desc, collect_net_ns, (void *)(for_dump ? 1UL : 0));
 }
 
 struct ns_desc net_ns_desc = NS_DESC_ENTRY(CLONE_NEWNET, "net");
 
-struct ns_id *net_get_root_ns()
+struct ns_id *net_get_root_ns(void)
 {
 	static struct ns_id *root_netns = NULL;
 
@@ -2726,7 +3442,7 @@ struct ns_id *net_get_root_ns()
 
 /*
  * socket_diag doesn't report unbound and unconnected sockets,
- * so we have to get their network namesapces explicitly
+ * so we have to get their network namespaces explicitly
  */
 struct ns_id *get_socket_ns(int lfd)
 {
@@ -2736,7 +3452,7 @@ struct ns_id *get_socket_ns(int lfd)
 
 	ns_fd = ioctl(lfd, SIOCGSKNS);
 	if (ns_fd < 0) {
-		/* backward compatiblity with old kernels */
+		/* backward compatibility with old kernels */
 		if (netns_nr == 1)
 			return net_get_root_ns();
 
@@ -2809,7 +3525,7 @@ static int move_to_bridge(struct external *ext, void *arg)
 		pr_debug("\tMoving dev %s to bridge %s\n", out, br);
 
 		if (s == -1) {
-			s = socket(AF_LOCAL, SOCK_STREAM|SOCK_CLOEXEC, 0);
+			s = socket(AF_LOCAL, SOCK_STREAM | SOCK_CLOEXEC, 0);
 			if (s < 0) {
 				pr_perror("Can't create control socket");
 				return -1;
@@ -2826,7 +3542,7 @@ static int move_to_bridge(struct external *ext, void *arg)
 			ret = -1;
 			goto out;
 		}
-		strlcpy(ifr.ifr_name, br, IFNAMSIZ);
+		__strlcpy(ifr.ifr_name, br, IFNAMSIZ);
 		ret = ioctl(s, SIOCBRADDIF, &ifr);
 		if (ret < 0) {
 			pr_perror("Can't add interface %s to bridge %s", out, br);
@@ -2838,7 +3554,7 @@ static int move_to_bridge(struct external *ext, void *arg)
 		 * $ ip link set dev <device> up
 		 */
 		ifr.ifr_ifindex = 0;
-		strlcpy(ifr.ifr_name, out, IFNAMSIZ);
+		__strlcpy(ifr.ifr_name, out, IFNAMSIZ);
 		ret = ioctl(s, SIOCGIFFLAGS, &ifr);
 		if (ret < 0) {
 			pr_perror("Can't get flags of interface %s", out);
@@ -2879,22 +3595,22 @@ int move_veth_to_bridge(void)
 #ifndef NETNSA_MAX
 /* Attributes of RTM_NEWNSID/RTM_GETNSID messages */
 enum {
-        NETNSA_NONE,
+	NETNSA_NONE,
 #define NETNSA_NSID_NOT_ASSIGNED -1
-        NETNSA_NSID,
-        NETNSA_PID,
-        NETNSA_FD,
-        __NETNSA_MAX,
+	NETNSA_NSID,
+	NETNSA_PID,
+	NETNSA_FD,
+	__NETNSA_MAX,
 };
 
-#define NETNSA_MAX              (__NETNSA_MAX - 1)
+#define NETNSA_MAX (__NETNSA_MAX - 1)
 #endif
 
 static struct nla_policy rtnl_net_policy[NETNSA_MAX + 1] = {
-        [NETNSA_NONE]           = { .type = NLA_UNSPEC },
-        [NETNSA_NSID]           = { .type = NLA_S32 },
-        [NETNSA_PID]            = { .type = NLA_U32 },
-        [NETNSA_FD]             = { .type = NLA_U32 },
+	[NETNSA_NONE] = { .type = NLA_UNSPEC },
+	[NETNSA_NSID] = { .type = NLA_S32 },
+	[NETNSA_PID] = { .type = NLA_U32 },
+	[NETNSA_FD] = { .type = NLA_U32 },
 };
 
 static int nsid_cb(struct nlmsghdr *msg, struct ns_id *ns, void *arg)
@@ -2902,8 +3618,7 @@ static int nsid_cb(struct nlmsghdr *msg, struct ns_id *ns, void *arg)
 	struct nlattr *tb[NETNSA_MAX + 1];
 	int err;
 
-	err = nlmsg_parse(msg, sizeof(struct rtgenmsg), tb,
-				NETNSA_MAX, rtnl_net_policy);
+	err = nlmsg_parse(msg, sizeof(struct rtgenmsg), tb, NETNSA_MAX, rtnl_net_policy);
 	if (err < 0)
 		return NL_STOP;
 
@@ -2954,7 +3669,7 @@ int net_get_nsid(int rtsk, int pid, int *nsid)
 	if (addattr_l(&req.nlh, sizeof(req), NETNSA_PID, &pid, sizeof(pid)))
 		return -1;
 
-	if (do_rtnl_req(rtsk, &req, req.nlh.nlmsg_len, nsid_cb, NULL, NULL, (void *) &id) < 0)
+	if (do_rtnl_req(rtsk, &req, req.nlh.nlmsg_len, nsid_cb, NULL, NULL, (void *)&id) < 0)
 		return -1;
 
 	if (id == INT_MIN)
@@ -2964,7 +3679,6 @@ int net_get_nsid(int rtsk, int pid, int *nsid)
 
 	return 0;
 }
-
 
 static int nsid_link_info(struct ns_id *ns, struct net_link *link, struct newlink_req *req)
 {
@@ -3024,7 +3738,7 @@ static int check_link_nsid(int rtsk, void *args)
 	memset(&req, 0, sizeof(req));
 	req.nlh.nlmsg_len = sizeof(req);
 	req.nlh.nlmsg_type = RTM_GETLINK;
-	req.nlh.nlmsg_flags = NLM_F_ROOT|NLM_F_MATCH|NLM_F_REQUEST;
+	req.nlh.nlmsg_flags = NLM_F_ROOT | NLM_F_MATCH | NLM_F_REQUEST;
 	req.nlh.nlmsg_pid = 0;
 	req.nlh.nlmsg_seq = CR_NLMSG_SEQ;
 	req.g.rtgen_family = AF_PACKET;
@@ -3032,7 +3746,7 @@ static int check_link_nsid(int rtsk, void *args)
 	return do_rtnl_req(rtsk, &req, sizeof(req), check_one_link_nsid, NULL, NULL, args);
 }
 
-int kerndat_link_nsid()
+int kerndat_link_nsid(void)
 {
 	int status;
 	pid_t pid;
@@ -3044,18 +3758,13 @@ int kerndat_link_nsid()
 	}
 
 	if (pid == 0) {
+		bool has_link_nsid;
 		NetDeviceEntry nde = NET_DEVICE_ENTRY__INIT;
 		struct net_link link = {
 			.created = false,
 			.nde = &nde,
 		};
 		int nsfd, sk, ret;
-
-		sk = socket(PF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
-		if (sk < 0) {
-			pr_perror("Unable to create a netlink socket");
-			exit(1);
-		}
 
 		if (unshare(CLONE_NEWNET)) {
 			pr_perror("Unable create a network namespace");
@@ -3068,6 +3777,12 @@ int kerndat_link_nsid()
 
 		if (unshare(CLONE_NEWNET)) {
 			pr_perror("Unable create a network namespace");
+			exit(1);
+		}
+
+		sk = socket(PF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+		if (sk < 0) {
+			pr_perror("Unable to create a netlink socket");
 			exit(1);
 		}
 
@@ -3086,12 +3801,16 @@ int kerndat_link_nsid()
 			exit(1);
 		}
 
-		bool has_link_nsid = false;
-		if (check_link_nsid(sk, &has_link_nsid))
+		has_link_nsid = false;
+		if (check_link_nsid(sk, &has_link_nsid)) {
+			pr_err("check_link_nsid failed\n");
 			exit(1);
+		}
 
-		if (!has_link_nsid)
+		if (!has_link_nsid) {
+			pr_err("check_link_nsid succeeded but has_link_nsid is false\n");
 			exit(5);
+		}
 
 		close(sk);
 

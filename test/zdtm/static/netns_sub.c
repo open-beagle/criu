@@ -14,7 +14,7 @@
 
 #include "zdtmtst.h"
 
-const char *test_doc	= "Check dump and restore a few network namespaces";
+const char *test_doc = "Check dump and restore a few network namespaces";
 
 static int fill_name(int nsid, struct sockaddr_un *name)
 {
@@ -41,7 +41,7 @@ static int create_socket(int nsid)
 		return -1;
 	}
 
-	if (bind(sk, (struct sockaddr *) &name, len) < 0) {
+	if (bind(sk, (struct sockaddr *)&name, len) < 0) {
 		pr_perror("bind");
 		close(sk);
 		return -1;
@@ -63,7 +63,7 @@ static int check_socket(int nsid, bool success)
 		return -1;
 	}
 
-	if (connect(sk, (struct sockaddr *) &name, len) < 0) {
+	if (connect(sk, (struct sockaddr *)&name, len) < 0) {
 		if (!success && errno == ECONNREFUSED)
 			return 0;
 		pr_perror("connect to %d", nsid);
@@ -100,7 +100,12 @@ int main(int argc, char **argv)
 	}
 	if (pid1 == 0) {
 		close(sk);
-		unshare(CLONE_NEWNET);
+		if (unshare(CLONE_NEWNET)) {
+			pr_perror("unshare");
+			return 1;
+		}
+		if (system("ip link set up dev lo"))
+			return 1;
 		sk = create_socket(1);
 		if (sk < 0)
 			return 1;
@@ -159,7 +164,12 @@ int main(int argc, char **argv)
 		return -1;
 	}
 	if (pid2 == 0) {
-		unshare(CLONE_NEWNET);
+		if (unshare(CLONE_NEWNET)) {
+			pr_perror("unshare");
+			return 1;
+		}
+		if (system("ip link set up dev lo"))
+			return 1;
 		sk = create_socket(2);
 		if (sk < 0)
 			return 1;

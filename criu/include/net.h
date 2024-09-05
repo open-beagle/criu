@@ -7,7 +7,7 @@
 #include "external.h"
 
 #ifndef RTM_GETNSID
-#define RTM_GETNSID		90
+#define RTM_GETNSID 90
 #endif
 
 struct cr_imgset;
@@ -31,7 +31,7 @@ extern int collect_net_namespaces(bool for_dump);
 
 extern int network_lock(void);
 extern void network_unlock(void);
-extern int network_lock_internal();
+extern int network_lock_internal(void);
 
 extern struct ns_desc net_ns_desc;
 
@@ -45,10 +45,14 @@ extern int veth_pair_add(char *in, char *out);
 extern int macvlan_ext_add(struct external *ext);
 extern int move_veth_to_bridge(void);
 
+extern int kerndat_has_newifindex(void);
+
 extern int kerndat_link_nsid(void);
 extern int net_get_nsid(int rtsk, int fd, int *nsid);
-extern struct ns_id *net_get_root_ns();
-extern int kerndat_nsid(void);
+extern struct ns_id *net_get_root_ns(void);
 extern void check_has_netns_ioc(int fd, bool *kdat_val, const char *name);
+extern int net_set_ext(struct ns_id *ns);
+extern struct ns_id *get_root_netns(void);
+extern int read_net_ns_img(void);
 
 #endif /* __CR_NET_H__ */

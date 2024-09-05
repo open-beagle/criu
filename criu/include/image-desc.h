@@ -26,6 +26,8 @@ enum {
 	CR_FD_UTSNS,
 	CR_FD_MNTS,
 	CR_FD_USERNS,
+	CR_FD_TIMENS,
+	CR_FD_PIDNS,
 
 	_CR_FD_IPCNS_FROM,
 	CR_FD_IPC_VAR,
@@ -42,6 +44,7 @@ enum {
 	CR_FD_RULE,
 	CR_FD_IPTABLES,
 	CR_FD_IP6TABLES,
+	CR_FD_NFTABLES,
 	CR_FD_NETNS,
 	CR_FD_NETNF_CT,
 	CR_FD_NETNF_EXP,
@@ -64,6 +67,10 @@ enum {
 	CR_FD_CGROUP,
 	CR_FD_FILE_LOCKS,
 	CR_FD_SECCOMP,
+	CR_FD_APPARMOR,
+	CR_FD_MEMFD_INODE,
+	CR_FD_BPFMAP_FILE,
+	CR_FD_BPFMAP_DATA,
 	_CR_FD_GLOB_TO,
 
 	CR_FD_TMPFS_IMG,
@@ -79,7 +86,6 @@ enum {
 	CR_FD_RLIMIT,
 	CR_FD_ITIMERS,
 	CR_FD_POSIX_TIMERS,
-	CR_FD_FILE_LOCKS_PID,
 
 	CR_FD_IRMAP_CACHE,
 	CR_FD_CPUINFO,
@@ -106,6 +112,7 @@ enum {
 	CR_FD_FIFO,
 	CR_FD_PIPES,
 	CR_FD_TTY_FILES,
+	CR_FD_MEMFD_FILE,
 
 	CR_FD_AUTOFS,
 
@@ -114,9 +121,9 @@ enum {
 
 /* file descriptors template */
 struct cr_fd_desc_tmpl {
-	const char	*fmt;			/* format for the name */
-	u32		magic;			/* magic in the header */
-	int		oflags;			/* flags for image_open */
+	const char *fmt; /* format for the name */
+	u32 magic;	 /* magic in the header */
+	int oflags;	 /* flags for image_open */
 };
 
 extern struct cr_fd_desc_tmpl imgset_template[CR_FD_MAX];

@@ -3,10 +3,11 @@
 #include "common/scm.h"
 #include "common/compiler.h"
 #include "common/lock.h"
+#include "common/page.h"
 
-#define pr_err(fmt, ...)	print_on_level(1, fmt, ##__VA_ARGS__)
-#define pr_info(fmt, ...)	print_on_level(3, fmt, ##__VA_ARGS__)
-#define pr_debug(fmt, ...)	print_on_level(4, fmt, ##__VA_ARGS__)
+#define pr_err(fmt, ...)   print_on_level(1, fmt, ##__VA_ARGS__)
+#define pr_info(fmt, ...)  print_on_level(3, fmt, ##__VA_ARGS__)
+#define pr_debug(fmt, ...) print_on_level(4, fmt, ##__VA_ARGS__)
 
 #include "common/bug.h"
 
@@ -18,6 +19,19 @@
 static int tsock = -1;
 
 static struct rt_sigframe *sigframe;
+
+#ifdef ARCH_HAS_LONG_PAGES
+/*
+ * XXX: Make it compel's std plugin global variable. Drop parasite_size().
+ * Hint: compel on aarch64 shall learn relocs for that.
+ */
+static unsigned __page_size;
+
+unsigned long __attribute((weak)) page_size(void)
+{
+	return __page_size;
+}
+#endif
 
 int parasite_get_rpc_sock(void)
 {
@@ -37,8 +51,7 @@ static int __parasite_daemon_reply_ack(unsigned int cmd, int err)
 		return -1;
 	}
 
-	pr_debug("__sent ack msg: %d %d %d\n",
-		 m.cmd, m.ack, m.err);
+	pr_debug("__sent ack msg: %d %d %d\n", m.cmd, m.ack, m.err);
 
 	return 0;
 }
@@ -50,16 +63,14 @@ static int __parasite_daemon_wait_msg(struct ctl_msg *m)
 	pr_debug("Daemon waits for command\n");
 
 	while (1) {
-		*m = (struct ctl_msg){ };
+		*m = (struct ctl_msg){};
 		ret = sys_recvfrom(tsock, m, sizeof(*m), MSG_WAITALL, NULL, 0);
 		if (ret != sizeof(*m)) {
-			pr_err("Trimmed message received (%d/%d)\n",
-			       (int)sizeof(*m), ret);
+			pr_err("Trimmed message received (%d/%d)\n", (int)sizeof(*m), ret);
 			return -1;
 		}
 
-		pr_debug("__fetched msg: %d %d %d\n",
-			 m->cmd, m->ack, m->err);
+		pr_debug("__fetched msg: %d %d %d\n", m->cmd, m->ack, m->err);
 		return 0;
 	}
 
@@ -80,8 +91,7 @@ static int fini(void)
 	parasite_cleanup();
 
 	new_sp = (long)sigframe + RT_SIGFRAME_OFFSET(sigframe);
-	pr_debug("%ld: new_sp=%lx ip %lx\n", sys_gettid(),
-		  new_sp, RT_SIGFRAME_REGIP(sigframe));
+	pr_debug("%ld: new_sp=%lx ip %lx\n", sys_gettid(), new_sp, RT_SIGFRAME_REGIP(sigframe));
 
 	sys_close(tsock);
 	std_log_set_fd(-1);
@@ -141,7 +151,10 @@ static noinline __used int parasite_init_daemon(void *data)
 	int ret;
 
 	args->sigreturn_addr = (uint64_t)(uintptr_t)fini_sigreturn;
-	sigframe = (void*)(uintptr_t)args->sigframe;
+	sigframe = (void *)(uintptr_t)args->sigframe;
+#ifdef ARCH_HAS_LONG_PAGES
+	__page_size = args->page_size;
+#endif
 
 	ret = tsock = sys_socket(PF_UNIX, SOCK_SEQPACKET, 0);
 	if (tsock < 0) {
@@ -176,11 +189,25 @@ err:
 }
 
 #ifndef __parasite_entry
-# define __parasite_entry
+#define __parasite_entry
 #endif
 
-int __used __parasite_entry parasite_service(unsigned int cmd, void *args)
+/*
+ * __export_parasite_service_{cmd,args} serve as arguments to the
+ * parasite_service() function. We use these global variables to make it
+ * easier to pass arguments when invoking from ptrace.
+ *
+ * We need the linker to allocate these variables. Hence the dummy
+ * initialization. Otherwise, we end up with COMMON symbols.
+ */
+unsigned int __export_parasite_service_cmd = 0;
+void *__export_parasite_service_args_ptr = NULL;
+
+int __used __parasite_entry parasite_service(void)
 {
+	unsigned int cmd = __export_parasite_service_cmd;
+	void *args = __export_parasite_service_args_ptr;
+
 	pr_info("Parasite cmd %d/%x process\n", cmd, cmd);
 
 	if (cmd == PARASITE_CMD_INIT_DAEMON)

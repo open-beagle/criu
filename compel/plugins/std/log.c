@@ -16,6 +16,7 @@ struct simple_buf {
 static int logfd = -1;
 static int cur_loglevel = COMPEL_DEFAULT_LOGLEVEL;
 static struct timeval start;
+static gettimeofday_t __std_gettimeofday;
 
 static void sbuf_log_flush(struct simple_buf *b);
 
@@ -54,7 +55,7 @@ static void sbuf_log_init(struct simple_buf *b)
 	if (start.tv_sec != 0) {
 		struct timeval now;
 
-		sys_gettimeofday(&now, NULL);
+		std_gettimeofday(&now, NULL);
 		timediff(&start, &now);
 
 		/* Seconds */
@@ -120,7 +121,7 @@ void std_log_set_fd(int fd)
 	logfd = fd;
 }
 
-void std_log_set_loglevel(unsigned int level)
+void std_log_set_loglevel(enum __compel_log_levels level)
 {
 	cur_loglevel = level;
 }
@@ -128,6 +129,19 @@ void std_log_set_loglevel(unsigned int level)
 void std_log_set_start(struct timeval *s)
 {
 	start = *s;
+}
+
+void std_log_set_gettimeofday(gettimeofday_t gtod)
+{
+	__std_gettimeofday = gtod;
+}
+
+int std_gettimeofday(struct timeval *tv, struct timezone *tz)
+{
+	if (__std_gettimeofday != NULL)
+		return __std_gettimeofday(tv, tz);
+
+	return sys_gettimeofday(tv, tz);
 }
 
 static void print_string(const char *msg, struct simple_buf *b)
@@ -208,6 +222,22 @@ static void print_num_l(long num, struct simple_buf *b)
 	}
 done:
 	s++;
+	print_string(s, b);
+}
+
+static void print_num_u(unsigned long num, struct simple_buf *b)
+{
+	char buf[22], *s;
+
+	buf[21] = '\0';
+	s = &buf[21];
+
+	do {
+		s--;
+		*s = (num % 10) + '0';
+		num /= 10;
+	} while (num > 0);
+
 	print_string(s, b);
 }
 
@@ -315,10 +345,17 @@ static void sbuf_printf(struct simple_buf *b, const char *format, va_list args)
 		case 'p':
 			print_hex_l((unsigned long)va_arg(args, void *), b);
 			break;
-		default:
-			print_string("UNKNOWN FORMAT ", b);
-			sbuf_putc(b, *s);
+		case 'u':
+			if (along)
+				print_num_u(va_arg(args, unsigned long), b);
+			else
+				print_num_u(va_arg(args, unsigned), b);
 			break;
+		default:
+			print_string("\nError: Unknown printf format %", b);
+			sbuf_putc(b, *s);
+			sbuf_putc(b, '\n');
+			return;
 		}
 		s++;
 	}

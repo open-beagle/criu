@@ -1,13 +1,13 @@
 #include "zdtmtst.h"
 
 #ifdef ZDTM_IPV4V6
-#define ZDTM_FAMILY AF_INET
+#define ZDTM_FAMILY	AF_INET
 #define ZDTM_SRV_FAMILY AF_INET6
 #elif defined(ZDTM_IPV6)
-#define ZDTM_FAMILY AF_INET6
+#define ZDTM_FAMILY	AF_INET6
 #define ZDTM_SRV_FAMILY AF_INET6
 #else
-#define ZDTM_FAMILY AF_INET
+#define ZDTM_FAMILY	AF_INET
 #define ZDTM_SRV_FAMILY AF_INET
 #endif
 
@@ -23,6 +23,7 @@ const char *test_author = "Andrey Vagin <avagin@openvz.org";
 #include <signal.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
+#include <signal.h>
 
 static int port = 8880;
 
@@ -43,6 +44,7 @@ int main(int argc, char **argv)
 #endif
 
 	test_init(argc, argv);
+	signal(SIGPIPE, SIG_IGN);
 
 	sk = socket(ZDTM_FAMILY, SOCK_STREAM, 0);
 	if (sk < 0) {
@@ -126,7 +128,7 @@ int main(int argc, char **argv)
 		return 1;
 	}
 	if (memcmp(&addr, &dst_addr, aux)) {
-		pr_err("A destination address mismatch");
+		pr_err("A destination address mismatch\n");
 		return 1;
 	}
 
@@ -135,7 +137,7 @@ int main(int argc, char **argv)
 		return 1;
 	}
 	if (memcmp(&addr, &src_addr, aux)) {
-		pr_err("A source address mismatch");
+		pr_err("A source address mismatch\n");
 		return 1;
 	}
 

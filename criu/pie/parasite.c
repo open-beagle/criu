@@ -3,15 +3,17 @@
 #include <signal.h>
 #include <linux/limits.h>
 #include <linux/capability.h>
-#include <sys/mount.h>
 #include <stdarg.h>
 #include <sys/ioctl.h>
 #include <sys/uio.h>
+
+#include "linux/rseq.h"
 
 #include "common/config.h"
 #include "int.h"
 #include "types.h"
 #include <compel/plugins/std/syscall.h>
+#include "linux/mount.h"
 #include "parasite.h"
 #include "fcntl.h"
 #include "prctl.h"
@@ -32,11 +34,15 @@
 static struct parasite_dump_pages_args *mprotect_args = NULL;
 
 #ifndef SPLICE_F_GIFT
-#define SPLICE_F_GIFT	0x08
+#define SPLICE_F_GIFT 0x08
 #endif
 
 #ifndef PR_GET_PDEATHSIG
-#define PR_GET_PDEATHSIG  2
+#define PR_GET_PDEATHSIG 2
+#endif
+
+#ifndef PR_GET_CHILD_SUBREAPER
+#define PR_GET_CHILD_SUBREAPER 37
 #endif
 
 static int mprotect_vmas(struct parasite_dump_pages_args *args)
@@ -49,8 +55,7 @@ static int mprotect_vmas(struct parasite_dump_pages_args *args)
 		vma = vmas + i;
 		ret = sys_mprotect((void *)vma->start, vma->len, vma->prot | args->add_prot);
 		if (ret) {
-			pr_err("mprotect(%08lx, %lu) failed with code %d\n",
-						vma->start, vma->len, ret);
+			pr_err("mprotect(%08lx, %ld) failed with code %d\n", vma->start, vma->len, ret);
 			break;
 		}
 	}
@@ -67,7 +72,8 @@ static int dump_pages(struct parasite_dump_pages_args *args)
 {
 	int p, ret, tsock;
 	struct iovec *iovs;
-	int off, nr_segs, nr_pages;
+	int off, nr_segs;
+	unsigned long spliced_bytes = 0;
 
 	tsock = parasite_get_rpc_sock();
 	p = recv_fd(tsock);
@@ -75,30 +81,27 @@ static int dump_pages(struct parasite_dump_pages_args *args)
 		return -1;
 
 	iovs = pargs_iovs(args);
-	nr_pages = 0;
 	off = 0;
 	nr_segs = args->nr_segs;
 	if (nr_segs > UIO_MAXIOV)
 		nr_segs = UIO_MAXIOV;
 	while (1) {
-		ret = sys_vmsplice(p, &iovs[args->off + off], nr_segs,
-					SPLICE_F_GIFT | SPLICE_F_NONBLOCK);
+		ret = sys_vmsplice(p, &iovs[args->off + off], nr_segs, SPLICE_F_GIFT | SPLICE_F_NONBLOCK);
 		if (ret < 0) {
 			sys_close(p);
-			pr_err("Can't splice pages to pipe (%d/%d/%d)\n",
-						ret, nr_segs, args->off + off);
+			pr_err("Can't splice pages to pipe (%d/%d/%d)\n", ret, nr_segs, args->off + off);
 			return -1;
 		}
-		nr_pages += ret;
+		spliced_bytes += ret;
 		off += nr_segs;
 		if (off == args->nr_segs)
 			break;
 		if (off + nr_segs > args->nr_segs)
 			nr_segs = args->nr_segs - off;
 	}
-	if (nr_pages != args->nr_pages * PAGE_SIZE) {
+	if (spliced_bytes != args->nr_pages * PAGE_SIZE) {
 		sys_close(p);
-		pr_err("Can't splice all pages to pipe (%d/%d)\n", nr_pages, args->nr_pages);
+		pr_err("Can't splice all pages to pipe (%ld/%d)\n", spliced_bytes, args->nr_pages);
 		return -1;
 	}
 
@@ -147,49 +150,128 @@ static int dump_posix_timers(struct parasite_dump_posix_timers_args *args)
 	int i;
 	int ret = 0;
 
-	for(i = 0; i < args->timer_n; i++) {
+	for (i = 0; i < args->timer_n; i++) {
 		ret = sys_timer_gettime(args->timer[i].it_id, &args->timer[i].val);
 		if (ret < 0) {
 			pr_err("sys_timer_gettime failed (%d)\n", ret);
 			return ret;
 		}
-		args->timer[i].overrun = sys_timer_getoverrun(args->timer[i].it_id);
-		ret = args->timer[i].overrun;
+		ret = sys_timer_getoverrun(args->timer[i].it_id);
 		if (ret < 0) {
 			pr_err("sys_timer_getoverrun failed (%d)\n", ret);
 			return ret;
 		}
+		args->timer[i].overrun = ret;
+		ret = 0;
 	}
 
 	return ret;
 }
 
 static int dump_creds(struct parasite_dump_creds *args);
+static int check_rseq(struct parasite_check_rseq *rseq);
 
 static int dump_thread_common(struct parasite_dump_thread *ti)
 {
 	int ret;
 
 	arch_get_tls(&ti->tls);
-	ret = sys_prctl(PR_GET_TID_ADDRESS, (unsigned long) &ti->tid_addr, 0, 0, 0);
-	if (ret)
+	ret = sys_prctl(PR_GET_TID_ADDRESS, (unsigned long)&ti->tid_addr, 0, 0, 0);
+	if (ret) {
+		pr_err("Unable to get the clear_child_tid address: %d\n", ret);
 		goto out;
+	}
 
 	ret = sys_sigaltstack(NULL, &ti->sas);
-	if (ret)
+	if (ret) {
+		pr_err("Unable to get signal stack context: %d\n", ret);
 		goto out;
+	}
 
 	ret = sys_prctl(PR_GET_PDEATHSIG, (unsigned long)&ti->pdeath_sig, 0, 0, 0);
-	if (ret)
+	if (ret) {
+		pr_err("Unable to get the parent death signal: %d\n", ret);
 		goto out;
+	}
+
+	ret = sys_prctl(PR_GET_NAME, (unsigned long)&ti->comm, 0, 0, 0);
+	if (ret) {
+		pr_err("Unable to get the thread name: %d\n", ret);
+		goto out;
+	}
+
+	ret = check_rseq(&ti->rseq);
+	if (ret) {
+		pr_err("Unable to check if rseq() is initialized: %d\n", ret);
+		goto out;
+	}
 
 	ret = dump_creds(ti->creds);
 out:
 	return ret;
 }
 
+/*
+ * Returns a membarrier() registration command (it is a bitmask) if the process
+ * was registered for specified (as a bit index) membarrier()-issuing command;
+ * returns zero otherwise.
+ */
+static int get_membarrier_registration_mask(int cmd_bit)
+{
+	unsigned cmd = 1 << cmd_bit;
+	int ret;
+
+	/*
+	 * Issuing a barrier will be successful only if the process was registered
+	 * for this type of membarrier. All errors are a sign that the type issued
+	 * was not registered (EPERM) or not supported by kernel (EINVAL or ENOSYS).
+	 */
+	ret = sys_membarrier(cmd, 0, 0);
+	if (ret && ret != -EPERM && ret != -EINVAL && ret != -ENOSYS) {
+		pr_err("membarrier(1 << %d) returned %d\n", cmd_bit, ret);
+		return -1;
+	}
+	pr_debug("membarrier(1 << %d) returned %d\n", cmd_bit, ret);
+	/*
+	 * For supported registrations, MEMBARRIER_CMD_REGISTER_xxx = MEMBARRIER_CMD_xxx << 1.
+	 * See: enum membarrier_cmd in include/uapi/linux/membarrier.h in kernel sources.
+	 */
+	return ret ? 0 : cmd << 1;
+}
+
+/*
+ * It would be better to check the following with BUILD_BUG_ON, but we might
+ * have an old linux/membarrier.h header without necessary enum values.
+ */
+#define MEMBARRIER_CMDBIT_PRIVATE_EXPEDITED	      3
+#define MEMBARRIER_CMDBIT_PRIVATE_EXPEDITED_SYNC_CORE 5
+#define MEMBARRIER_CMDBIT_PRIVATE_EXPEDITED_RSEQ      7
+#define MEMBARRIER_CMDBIT_GET_REGISTRATIONS	      9
+
+static int dump_membarrier_compat(int *membarrier_registration_mask)
+{
+	int ret;
+
+	*membarrier_registration_mask = 0;
+	ret = get_membarrier_registration_mask(MEMBARRIER_CMDBIT_PRIVATE_EXPEDITED);
+	if (ret < 0)
+		return -1;
+	*membarrier_registration_mask |= ret;
+	ret = get_membarrier_registration_mask(MEMBARRIER_CMDBIT_PRIVATE_EXPEDITED_SYNC_CORE);
+	if (ret < 0)
+		return -1;
+	*membarrier_registration_mask |= ret;
+	ret = get_membarrier_registration_mask(MEMBARRIER_CMDBIT_PRIVATE_EXPEDITED_RSEQ);
+	if (ret < 0)
+		return -1;
+	*membarrier_registration_mask |= ret;
+	return 0;
+}
+
 static int dump_misc(struct parasite_dump_misc *args)
 {
+	int ret;
+
 	args->brk = sys_brk(0);
 
 	args->pid = sys_getpid();
@@ -200,14 +282,31 @@ static int dump_misc(struct parasite_dump_misc *args)
 	args->dumpable = sys_prctl(PR_GET_DUMPABLE, 0, 0, 0, 0);
 	args->thp_disabled = sys_prctl(PR_GET_THP_DISABLE, 0, 0, 0, 0);
 
-	return 0;
+	if (args->has_membarrier_get_registrations) {
+		ret = sys_membarrier(1 << MEMBARRIER_CMDBIT_GET_REGISTRATIONS, 0, 0);
+		if (ret < 0) {
+			pr_err("membarrier(1 << %d) returned %d\n", MEMBARRIER_CMDBIT_GET_REGISTRATIONS, ret);
+			return -1;
+		}
+		args->membarrier_registration_mask = ret;
+	} else {
+		ret = dump_membarrier_compat(&args->membarrier_registration_mask);
+		if (ret)
+			return ret;
+	}
+
+	ret = sys_prctl(PR_GET_CHILD_SUBREAPER, (unsigned long)&args->child_subreaper, 0, 0, 0);
+	if (ret)
+		pr_err("PR_GET_CHILD_SUBREAPER failed (%d)\n", ret);
+
+	return ret;
 }
 
 static int dump_creds(struct parasite_dump_creds *args)
 {
 	int ret, i, j;
 	struct cap_data data[_LINUX_CAPABILITY_U32S_3];
-	struct cap_header hdr = {_LINUX_CAPABILITY_VERSION_3, 0};
+	struct cap_header hdr = { _LINUX_CAPABILITY_VERSION_3, 0 };
 
 	ret = sys_capget(&hdr, data);
 	if (ret < 0) {
@@ -231,8 +330,7 @@ static int dump_creds(struct parasite_dump_creds *args)
 				break;
 			ret = sys_prctl(PR_CAPBSET_READ, j + i * 32, 0, 0, 0);
 			if (ret < 0) {
-				pr_err("Unable to read capability %d: %d\n",
-					j + i * 32, ret);
+				pr_err("Unable to read capability %d: %d\n", j + i * 32, ret);
 				return -1;
 			}
 			if (ret)
@@ -240,6 +338,7 @@ static int dump_creds(struct parasite_dump_creds *args)
 		}
 	}
 
+	args->no_new_privs = sys_prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0);
 	args->secbits = sys_prctl(PR_GET_SECUREBITS, 0, 0, 0, 0);
 
 	ret = sys_getgroups(0, NULL);
@@ -257,8 +356,7 @@ static int dump_creds(struct parasite_dump_creds *args)
 		goto grps_err;
 
 	if (ret != args->ngroups) {
-		pr_err("Groups changed on the fly %d -> %d\n",
-				args->ngroups, ret);
+		pr_err("Groups changed on the fly %d -> %d\n", args->ngroups, ret);
 		return -1;
 	}
 
@@ -271,7 +369,7 @@ static int dump_creds(struct parasite_dump_creds *args)
 	args->uids[3] = sys_setfsuid(-1L);
 
 	/*
-	 * FIXME In https://github.com/xemul/criu/issues/95 it is
+	 * FIXME In https://github.com/checkpoint-restore/criu/issues/95 it is
 	 * been reported that only low 16 bits are set upon syscall
 	 * on ARMv7.
 	 *
@@ -295,15 +393,151 @@ grps_err:
 	return -1;
 }
 
+static int check_rseq(struct parasite_check_rseq *rseq)
+{
+	int ret;
+	unsigned long rseq_abi_pointer;
+	unsigned long rseq_abi_size;
+	uint32_t rseq_signature;
+	void *addr;
+
+	/* no need to do hacky check if we can get all info from ptrace() */
+	if (!rseq->has_rseq || rseq->has_ptrace_get_rseq_conf)
+		return 0;
+
+	/*
+	 * We need to determine if victim process has rseq()
+	 * initialized, but we have no *any* proper kernel interface
+	 * supported at this point.
+	 * Our plan:
+	 * 1. We know that if we call rseq() syscall and process already
+	 * has current->rseq filled, then we get:
+	 * -EINVAL if current->rseq != rseq || rseq_len != sizeof(*rseq),
+	 * -EPERM  if current->rseq_sig != sig),
+	 * -EBUSY  if current->rseq == rseq && rseq_len == sizeof(*rseq) &&
+	 *            current->rseq_sig != sig
+	 * if current->rseq == NULL (rseq() wasn't used) then we go to:
+	 * IS_ALIGNED(rseq ...) check, if we fail it we get -EINVAL and it
+	 * will be hard to distinguish case when rseq() was initialized or not.
+	 * Let's construct arguments payload
+	 * with:
+	 * 1. correct rseq_abi_size
+	 * 2. aligned and correct rseq_abi_pointer
+	 * And see what rseq() return to us.
+	 * If ret value is:
+	 * 0: it means that rseq *wasn't* used and we successfully registered it,
+	 * -EINVAL or : it means that rseq is already initialized,
+	 * so we *have* to dump it. But as we have has_ptrace_get_rseq_conf = false,
+	 * we should just fail dump as it's unsafe to skip rseq() dump for processes
+	 * with rseq() initialized.
+	 * -EPERM or -EBUSY: should not happen as we take a fresh memory area for rseq
+	 */
+	addr = (void *)sys_mmap(NULL, sizeof(struct criu_rseq), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1,
+				0);
+	if (addr == MAP_FAILED) {
+		pr_err("mmap() failed for struct rseq ret = %lx\n", (unsigned long)addr);
+		return -1;
+	}
+
+	memset(addr, 0, sizeof(struct criu_rseq));
+
+	/* sys_mmap returns page aligned addresses */
+	rseq_abi_pointer = (unsigned long)addr;
+	rseq_abi_size = (unsigned long)sizeof(struct criu_rseq);
+	/* it's not so important to have unique signature for us,
+	 * because rseq_abi_pointer is guaranteed to be unique
+	 */
+	rseq_signature = 0x12345612;
+
+	pr_info("\ttrying sys_rseq(%lx, %lx, %x, %x)\n", rseq_abi_pointer, rseq_abi_size, 0, rseq_signature);
+	ret = sys_rseq((void *)rseq_abi_pointer, rseq_abi_size, 0, rseq_signature);
+	if (ret) {
+		if (ret == -EINVAL) {
+			pr_info("\trseq is initialized in the victim\n");
+			rseq->rseq_inited = true;
+
+			ret = 0;
+		} else {
+			pr_err("\tunexpected failure of sys_rseq(%lx, %lx, %x, %x) = %d\n", rseq_abi_pointer,
+			       rseq_abi_size, 0, rseq_signature, ret);
+
+			ret = -1;
+		}
+	} else {
+		ret = sys_rseq((void *)rseq_abi_pointer, sizeof(struct criu_rseq), RSEQ_FLAG_UNREGISTER,
+			       rseq_signature);
+		if (ret) {
+			pr_err("\tfailed to unregister sys_rseq(%lx, %lx, %x, %x) = %d\n", rseq_abi_pointer,
+			       rseq_abi_size, RSEQ_FLAG_UNREGISTER, rseq_signature, ret);
+
+			ret = -1;
+			/* we can't do munmap() because rseq is registered and we failed to unregister it */
+			goto out_nounmap;
+		}
+
+		rseq->rseq_inited = false;
+		ret = 0;
+	}
+
+	sys_munmap(addr, sizeof(struct criu_rseq));
+out_nounmap:
+	return ret;
+}
+
+static int fill_fds_fown(int fd, struct fd_opts *p)
+{
+	int flags, ret;
+	struct f_owner_ex owner_ex;
+	uint32_t v[2];
+
+	/*
+	 * For O_PATH opened files there is no owner at all.
+	 */
+	flags = sys_fcntl(fd, F_GETFL, 0);
+	if (flags < 0) {
+		pr_err("fcntl(%d, F_GETFL) -> %d\n", fd, flags);
+		return -1;
+	}
+	if (flags & O_PATH) {
+		p->fown.pid = 0;
+		return 0;
+	}
+
+	ret = sys_fcntl(fd, F_GETOWN_EX, (long)&owner_ex);
+	if (ret) {
+		pr_err("fcntl(%d, F_GETOWN_EX) -> %d\n", fd, ret);
+		return -1;
+	}
+
+	/*
+	 * Simple case -- nothing is changed.
+	 */
+	if (owner_ex.pid == 0) {
+		p->fown.pid = 0;
+		return 0;
+	}
+
+	ret = sys_fcntl(fd, F_GETOWNER_UIDS, (long)&v);
+	if (ret) {
+		pr_err("fcntl(%d, F_GETOWNER_UIDS) -> %d\n", fd, ret);
+		return -1;
+	}
+
+	p->fown.uid = v[0];
+	p->fown.euid = v[1];
+	p->fown.pid_type = owner_ex.type;
+	p->fown.pid = owner_ex.pid;
+
+	return 0;
+}
+
 static int fill_fds_opts(struct parasite_drain_fd *fds, struct fd_opts *opts)
 {
 	int i;
 
 	for (i = 0; i < fds->nr_fds; i++) {
-		int flags, fd = fds->fds[i], ret;
+		int flags, fd = fds->fds[i];
 		struct fd_opts *p = opts + i;
-		struct f_owner_ex owner_ex;
-		uint32_t v[2];
 
 		flags = sys_fcntl(fd, F_GETFD, 0);
 		if (flags < 0) {
@@ -313,30 +547,8 @@ static int fill_fds_opts(struct parasite_drain_fd *fds, struct fd_opts *opts)
 
 		p->flags = (char)flags;
 
-		ret = sys_fcntl(fd, F_GETOWN_EX, (long)&owner_ex);
-		if (ret) {
-			pr_err("fcntl(%d, F_GETOWN_EX) -> %d\n", fd, ret);
+		if (fill_fds_fown(fd, p))
 			return -1;
-		}
-
-		/*
-		 * Simple case -- nothing is changed.
-		 */
-		if (owner_ex.pid == 0) {
-			p->fown.pid = 0;
-			continue;
-		}
-
-		ret = sys_fcntl(fd, F_GETOWNER_UIDS, (long)&v);
-		if (ret) {
-			pr_err("fcntl(%d, F_GETOWNER_UIDS) -> %d\n", fd, ret);
-			return -1;
-		}
-
-		p->fown.uid	 = v[0];
-		p->fown.euid	 = v[1];
-		p->fown.pid_type = owner_ex.type;
-		p->fown.pid	 = owner_ex.pid;
 	}
 
 	return 0;
@@ -358,8 +570,7 @@ static int drain_fds(struct parasite_drain_fd *args)
 		return ret;
 
 	tsock = parasite_get_rpc_sock();
-	ret = send_fds(tsock, NULL, 0,
-		       args->fds, args->nr_fds, opts, sizeof(struct fd_opts));
+	ret = send_fds(tsock, NULL, 0, args->fds, args->nr_fds, opts, sizeof(struct fd_opts));
 	if (ret)
 		pr_err("send_fds failed (%d)\n", ret);
 
@@ -414,7 +625,7 @@ static int get_proc_fd(void)
 	ret = sys_mount("proc", proc_mountpoint, "proc", MS_MGC_VAL, NULL);
 	if (ret) {
 		if (ret == -EPERM)
-			pr_err("can't dump unpriviliged task whose /proc doesn't belong to it\n");
+			pr_err("can't dump unprivileged task whose /proc doesn't belong to it\n");
 		else
 			pr_err("mount failed (%d)\n", ret);
 		sys_rmdir(proc_mountpoint);
@@ -460,9 +671,9 @@ static inline int tty_ioctl(int fd, int cmd, int *arg)
  * as libaio does the same.
  */
 
-#define AIO_RING_MAGIC			0xa10a10a1
-#define AIO_RING_COMPAT_FEATURES	1
-#define AIO_RING_INCOMPAT_FEATURES	0
+#define AIO_RING_MAGIC		   0xa10a10a1
+#define AIO_RING_COMPAT_FEATURES   1
+#define AIO_RING_INCOMPAT_FEATURES 0
 
 static int sane_ring(struct parasite_aio *aio)
 {
@@ -471,11 +682,9 @@ static int sane_ring(struct parasite_aio *aio)
 
 	nr = (aio->size - sizeof(struct aio_ring)) / sizeof(struct io_event);
 
-	return ring->magic == AIO_RING_MAGIC &&
-		ring->compat_features == AIO_RING_COMPAT_FEATURES &&
-		ring->incompat_features == AIO_RING_INCOMPAT_FEATURES &&
-		ring->header_length == sizeof(struct aio_ring) &&
-		ring->nr == nr;
+	return ring->magic == AIO_RING_MAGIC && ring->compat_features == AIO_RING_COMPAT_FEATURES &&
+	       ring->incompat_features == AIO_RING_INCOMPAT_FEATURES &&
+	       ring->header_length == sizeof(struct aio_ring) && ring->nr == nr;
 }
 
 static int parasite_check_aios(struct parasite_check_aios_args *args)
@@ -507,15 +716,15 @@ static int parasite_dump_tty(struct parasite_tty_args *args)
 	int ret;
 
 #ifndef TIOCGPKT
-# define TIOCGPKT	_IOR('T', 0x38, int)
+#define TIOCGPKT _IOR('T', 0x38, int)
 #endif
 
 #ifndef TIOCGPTLCK
-# define TIOCGPTLCK	_IOR('T', 0x39, int)
+#define TIOCGPTLCK _IOR('T', 0x39, int)
 #endif
 
 #ifndef TIOCGEXCL
-# define TIOCGEXCL	_IOR('T', 0x40, int)
+#define TIOCGEXCL _IOR('T', 0x40, int)
 #endif
 
 	args->sid = 0;
@@ -524,26 +733,26 @@ static int parasite_dump_tty(struct parasite_tty_args *args)
 	args->st_lock = 0;
 	args->st_excl = 0;
 
-#define __tty_ioctl(cmd, arg)					\
-	do {							\
-		ret = tty_ioctl(args->fd, cmd, &arg);		\
-		if (ret < 0) {					\
-			if (ret == -ENOTTY)			\
-				arg = 0;			\
-			else if (ret == -EIO)			\
-				goto err_io;			\
-			else					\
-				goto err;			\
-		}						\
+#define __tty_ioctl(cmd, arg)                         \
+	do {                                          \
+		ret = tty_ioctl(args->fd, cmd, &arg); \
+		if (ret < 0) {                        \
+			if (ret == -ENOTTY)           \
+				arg = 0;              \
+			else if (ret == -EIO)         \
+				goto err_io;          \
+			else                          \
+				goto err;             \
+		}                                     \
 	} while (0)
 
 	__tty_ioctl(TIOCGSID, args->sid);
 	__tty_ioctl(TIOCGPGRP, args->pgrp);
-	__tty_ioctl(TIOCGEXCL,	args->st_excl);
+	__tty_ioctl(TIOCGEXCL, args->st_excl);
 
 	if (args->type == TTY_TYPE__PTY) {
-		__tty_ioctl(TIOCGPKT,	args->st_pckt);
-		__tty_ioctl(TIOCGPTLCK,	args->st_lock);
+		__tty_ioctl(TIOCGPKT, args->st_pckt);
+		__tty_ioctl(TIOCGPTLCK, args->st_lock);
 	}
 
 	args->hangup = false;
@@ -561,7 +770,6 @@ err_io:
 #undef __tty_ioctl
 }
 
-#ifdef CONFIG_VDSO
 static int parasite_check_vdso_mark(struct parasite_vdso_vma_entry *args)
 {
 	struct vdso_mark *m = (void *)args->start;
@@ -569,21 +777,21 @@ static int parasite_check_vdso_mark(struct parasite_vdso_vma_entry *args)
 	if (is_vdso_mark(m)) {
 		/*
 		 * Make sure we don't meet some corrupted entry
-		 * where signature matches but verions is not!
+		 * where signature matches but versions do not!
 		 */
 		if (m->version != VDSO_MARK_CUR_VERSION) {
 			pr_err("vdso: Mark version mismatch!\n");
 			return -EINVAL;
 		}
-		args->is_marked		= 1;
-		args->orig_vdso_addr	= m->orig_vdso_addr;
-		args->orig_vvar_addr	= m->orig_vvar_addr;
-		args->rt_vvar_addr	= m->rt_vvar_addr;
+		args->is_marked = 1;
+		args->orig_vdso_addr = m->orig_vdso_addr;
+		args->orig_vvar_addr = m->orig_vvar_addr;
+		args->rt_vvar_addr = m->rt_vvar_addr;
 	} else {
-		args->is_marked		= 0;
-		args->orig_vdso_addr	= VDSO_BAD_ADDR;
-		args->orig_vvar_addr	= VVAR_BAD_ADDR;
-		args->rt_vvar_addr	= VVAR_BAD_ADDR;
+		args->is_marked = 0;
+		args->orig_vdso_addr = VDSO_BAD_ADDR;
+		args->orig_vvar_addr = VVAR_BAD_ADDR;
+		args->rt_vvar_addr = VVAR_BAD_ADDR;
 
 		if (args->try_fill_symtable) {
 			struct vdso_symtable t;
@@ -597,13 +805,6 @@ static int parasite_check_vdso_mark(struct parasite_vdso_vma_entry *args)
 
 	return 0;
 }
-#else
-static inline int parasite_check_vdso_mark(struct parasite_vdso_vma_entry *args)
-{
-	pr_err("Unexpected VDSO check command\n");
-	return -1;
-}
-#endif
 
 static int parasite_dump_cgroup(struct parasite_dump_cgroup_args *args)
 {
@@ -615,7 +816,7 @@ static int parasite_dump_cgroup(struct parasite_dump_cgroup_args *args)
 		return -1;
 	}
 
-	cgroup = sys_openat(proc, "self/cgroup", O_RDONLY, 0);
+	cgroup = sys_openat(proc, args->thread_cgrp, O_RDONLY, 0);
 	sys_close(proc);
 	if (cgroup < 0) {
 		pr_err("can't get /proc/self/cgroup fd\n");

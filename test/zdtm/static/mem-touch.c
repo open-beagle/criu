@@ -7,10 +7,10 @@
 
 #include "zdtmtst.h"
 
-const char *test_doc	= "Check changing memory";
-const char *test_author	= "Pavel Emelyanov <xemul@parallels.com>";
+const char *test_doc = "Check changing memory";
+const char *test_author = "Pavel Emelyanov <xemul@parallels.com>";
 
-#define MEM_PAGES	16
+#define MEM_PAGES 16
 
 int main(int argc, char **argv)
 {
@@ -23,7 +23,7 @@ int main(int argc, char **argv)
 
 	test_init(argc, argv);
 
-	mem = mmap(NULL, MEM_PAGES * PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, 0, 0);
+	mem = mmap(NULL, MEM_PAGES * PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, 0, 0);
 	if (mem == MAP_FAILED)
 		return 1;
 
@@ -32,7 +32,10 @@ int main(int argc, char **argv)
 	test_daemon();
 	while (test_go()) {
 		unsigned pfn;
-		struct timespec req = { .tv_sec = 0, .tv_nsec = 100000, };
+		struct timespec req = {
+			.tv_sec = 0,
+			.tv_nsec = 100000,
+		};
 
 		pfn = random() % MEM_PAGES;
 		*(unsigned *)(mem + pfn * PAGE_SIZE) = rover;
@@ -46,17 +49,15 @@ int main(int argc, char **argv)
 	test_msg("final rover %u\n", rover);
 	for (i = 0; i < MEM_PAGES; i++)
 		if (backup[i] != *(unsigned *)(mem + i * PAGE_SIZE)) {
-			test_msg("Page %u differs want %u has %u\n", i,
-					backup[i], *(unsigned *)(mem + i * PAGE_SIZE));
+			test_msg("Page %u differs want %u has %u\n", i, backup[i], *(unsigned *)(mem + i * PAGE_SIZE));
 			fail = 1;
 		} else
 			test_msg("Page %u matches %u\n", i, backup[i]);
 
 	if (fail)
-		fail("Memory corruption\n");
+		fail("Memory corruption");
 	else
 		pass();
 
 	return 0;
 }
-

@@ -1,13 +1,13 @@
 #include "zdtmtst.h"
 
 #ifdef ZDTM_IPV4V6
-#define ZDTM_FAMILY AF_INET
+#define ZDTM_FAMILY	AF_INET
 #define ZDTM_SRV_FAMILY AF_INET6
 #elif defined(ZDTM_IPV6)
-#define ZDTM_FAMILY AF_INET6
+#define ZDTM_FAMILY	AF_INET6
 #define ZDTM_SRV_FAMILY AF_INET6
 #else
-#define ZDTM_FAMILY AF_INET
+#define ZDTM_FAMILY	AF_INET
 #define ZDTM_SRV_FAMILY AF_INET
 #endif
 
@@ -68,12 +68,16 @@ int main(int argc, char **argv)
 	socklen_t optlen;
 
 #ifdef ZDTM_CONNTRACK
-	unshare(CLONE_NEWNET);
+	if (unshare(CLONE_NEWNET)) {
+		pr_perror("unshare");
+		return 1;
+	}
 	if (system("ip link set up dev lo"))
 		return 1;
 	if (system("iptables -w -A INPUT -i lo -p tcp -m state --state NEW,ESTABLISHED -j ACCEPT"))
 		return 1;
-	system("iptables -A INPUT -j DROP");
+	if (system("iptables -w -A INPUT -j DROP"))
+		return 1;
 #endif
 
 #ifdef ZDTM_TCP_LOCAL
@@ -206,7 +210,7 @@ int main(int argc, char **argv)
 		return 1;
 	}
 	if (val != 1) {
-		fail("SO_REUSEADDR are not set for %d\n", fd);
+		fail("SO_REUSEADDR are not set for %d", fd);
 		return 1;
 	}
 

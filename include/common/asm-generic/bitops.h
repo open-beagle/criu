@@ -10,43 +10,44 @@
 
 #include "common/asm/bitsperlong.h"
 
-#define DIV_ROUND_UP(n,d)	(((n) + (d) - 1) / (d))
-#define BITS_TO_LONGS(nr)	DIV_ROUND_UP(nr, BITS_PER_LONG)
+#define DIV_ROUND_UP(n, d) (((n) + (d)-1) / (d))
+#define BITS_TO_LONGS(nr)  DIV_ROUND_UP(nr, BITS_PER_LONG)
 
-#define DECLARE_BITMAP(name, bits)		\
-	unsigned long name[BITS_TO_LONGS(bits)]
+#define DECLARE_BITMAP(name, bits) unsigned long name[BITS_TO_LONGS(bits)]
+#define BITMAP_SIZE(name)	   (sizeof(name) * CHAR_BIT)
 
 #if __GNUC__ < 4 || (__GNUC__ == 4 && __GNUC_MINOR__ < 1)
 /* Technically wrong, but this avoids compilation errors on some gcc
    versions. */
-#define BITOP_ADDR(x) "=m" (*(volatile long *) (x))
+#define BITOP_ADDR(x) "=m"(*(volatile long *)(x))
 #else
-#define BITOP_ADDR(x) "+m" (*(volatile long *) (x))
+#define BITOP_ADDR(x) "+m"(*(volatile long *)(x))
 #endif
 
-#define ADDR				BITOP_ADDR(addr)
+#define ADDR BITOP_ADDR(addr)
 
-static inline void set_bit(int nr, volatile unsigned long *addr) {
+static inline void set_bit(int nr, volatile unsigned long *addr)
+{
 	addr += nr / BITS_PER_LONG;
-	*addr |= (1 << (nr % BITS_PER_LONG));
+	*addr |= (1UL << (nr % BITS_PER_LONG));
 }
 
 static inline void change_bit(int nr, volatile unsigned long *addr)
 {
 	addr += nr / BITS_PER_LONG;
-	*addr ^= (1 << (nr % BITS_PER_LONG));
+	*addr ^= (1UL << (nr % BITS_PER_LONG));
 }
 
 static inline int test_bit(int nr, volatile const unsigned long *addr)
 {
 	addr += nr / BITS_PER_LONG;
-	return (*addr & (1 << (nr % BITS_PER_LONG))) ? -1 : 0;
+	return (*addr & (1UL << (nr % BITS_PER_LONG))) ? -1 : 0;
 }
 
 static inline void clear_bit(int nr, volatile unsigned long *addr)
 {
 	addr += nr / BITS_PER_LONG;
-	*addr &= ~(1 << (nr % BITS_PER_LONG));
+	*addr &= ~(1UL << (nr % BITS_PER_LONG));
 }
 
 /**
@@ -57,30 +58,18 @@ static inline void clear_bit(int nr, volatile unsigned long *addr)
  */
 static inline unsigned long __ffs(unsigned long word)
 {
-	int p = 0;
-
-	for (; p < 8*sizeof(word); ++p) {
-		if (word & 1) {
-			break;
-		}
-
-		word >>= 1;
-	}
-
-	return p;
+	return __builtin_ffsl(word) - 1;
 }
 
-#define BITOP_WORD(nr)		((nr) / BITS_PER_LONG)
+#define BITOP_WORD(nr) ((nr) / BITS_PER_LONG)
 
 /*
  * Find the next set bit in a memory region.
  */
-static inline
-unsigned long find_next_bit(const unsigned long *addr, unsigned long size,
-			    unsigned long offset)
+static inline unsigned long find_next_bit(const unsigned long *addr, unsigned long size, unsigned long offset)
 {
 	const unsigned long *p = addr + BITOP_WORD(offset);
-	unsigned long result = offset & ~(BITS_PER_LONG-1);
+	unsigned long result = offset & ~(BITS_PER_LONG - 1);
 	unsigned long tmp;
 
 	if (offset >= size)
@@ -97,7 +86,7 @@ unsigned long find_next_bit(const unsigned long *addr, unsigned long size,
 		size -= BITS_PER_LONG;
 		result += BITS_PER_LONG;
 	}
-	while (size & ~(BITS_PER_LONG-1)) {
+	while (size & ~(BITS_PER_LONG - 1)) {
 		if ((tmp = *(p++)))
 			goto found_middle;
 		result += BITS_PER_LONG;
@@ -109,15 +98,14 @@ unsigned long find_next_bit(const unsigned long *addr, unsigned long size,
 
 found_first:
 	tmp &= (~0UL >> (BITS_PER_LONG - size));
-	if (tmp == 0UL)		/* Are any bits set? */
-		return result + size;	/* Nope. */
+	if (tmp == 0UL)		      /* Are any bits set? */
+		return result + size; /* Nope. */
 found_middle:
 	return result + __ffs(tmp);
 }
 
-#define for_each_bit(i, bitmask)				\
-	for (i = find_next_bit(bitmask, sizeof(bitmask), 0);	\
-	     i < sizeof(bitmask);				\
-	     i = find_next_bit(bitmask, sizeof(bitmask), i + 1))
+#define for_each_bit(i, bitmask)                                                            \
+	for (i = find_next_bit(bitmask, BITMAP_SIZE(bitmask), 0); i < BITMAP_SIZE(bitmask); \
+	     i = find_next_bit(bitmask, BITMAP_SIZE(bitmask), i + 1))
 
 #endif /* __CR_GENERIC_BITOPS_H__ */

@@ -2,10 +2,15 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <linux/falloc.h>
+#include <netinet/tcp.h>
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
+
+#undef LOG_PREFIX
+#define LOG_PREFIX "page-xfer: "
 
 #include "types.h"
 #include "cr_options.h"
@@ -21,14 +26,15 @@
 #include "parasite-syscall.h"
 #include "rst_info.h"
 #include "stats.h"
+#include "tls.h"
 
 static int page_server_sk = -1;
 
 struct page_server_iov {
-	u32	cmd;
-	u32	nr_pages;
-	u64	vaddr;
-	u64	dst_id;
+	u32 cmd;
+	u32 nr_pages;
+	u64 vaddr;
+	u64 dst_id;
 };
 
 static void psi2iovec(struct page_server_iov *ps, struct iovec *iov)
@@ -37,25 +43,25 @@ static void psi2iovec(struct page_server_iov *ps, struct iovec *iov)
 	iov->iov_len = ps->nr_pages * PAGE_SIZE;
 }
 
-#define PS_IOV_ADD	1
-#define PS_IOV_HOLE	2
-#define PS_IOV_OPEN	3
-#define PS_IOV_OPEN2	4
-#define PS_IOV_PARENT	5
-#define PS_IOV_ADD_F	6
-#define PS_IOV_GET	7
+#define PS_IOV_ADD    1
+#define PS_IOV_HOLE   2
+#define PS_IOV_OPEN   3
+#define PS_IOV_OPEN2  4
+#define PS_IOV_PARENT 5
+#define PS_IOV_ADD_F  6
+#define PS_IOV_GET    7
 
-#define PS_IOV_FLUSH		0x1023
-#define PS_IOV_FLUSH_N_CLOSE	0x1024
+#define PS_IOV_CLOSE	   0x1023
+#define PS_IOV_FORCE_CLOSE 0x1024
 
-#define PS_CMD_BITS	16
-#define PS_CMD_MASK	((1 << PS_CMD_BITS) - 1)
+#define PS_CMD_BITS 16
+#define PS_CMD_MASK ((1 << PS_CMD_BITS) - 1)
 
-#define PS_TYPE_BITS	8
-#define PS_TYPE_MASK	((1 << PS_TYPE_BITS) - 1)
+#define PS_TYPE_BITS 8
+#define PS_TYPE_MASK ((1 << PS_TYPE_BITS) - 1)
 
-#define PS_TYPE_PID	(1)
-#define PS_TYPE_SHMEM	(2)
+#define PS_TYPE_PID   (1)
+#define PS_TYPE_SHMEM (2)
 /*
  * XXX: When adding new types here check decode_pm for legacy
  * numbers that can be met from older CRIUs
@@ -128,13 +134,22 @@ static inline u32 decode_ps_flags(u32 cmd)
 	return cmd >> PS_CMD_BITS;
 }
 
+static inline int __send(int sk, const void *buf, size_t sz, int fl)
+{
+	return opts.tls ? tls_send(buf, sz, fl) : send(sk, buf, sz, fl);
+}
+
+static inline int __recv(int sk, void *buf, size_t sz, int fl)
+{
+	return opts.tls ? tls_recv(buf, sz, fl) : recv(sk, buf, sz, fl);
+}
+
 static inline int send_psi_flags(int sk, struct page_server_iov *pi, int flags)
 {
-	if (send(sk, pi, sizeof(*pi), flags) != sizeof(*pi)) {
+	if (__send(sk, pi, sizeof(*pi), flags) != sizeof(*pi)) {
 		pr_perror("Can't send PSI %d to server", pi->cmd);
 		return -1;
 	}
-
 	return 0;
 }
 
@@ -143,15 +158,43 @@ static inline int send_psi(int sk, struct page_server_iov *pi)
 	return send_psi_flags(sk, pi, 0);
 }
 
-/* page-server xfer */
-static int write_pages_to_server(struct page_xfer *xfer,
-		int p, unsigned long len)
+static void tcp_cork(int sk, bool on)
 {
-	pr_debug("Splicing %lu bytes / %lu pages into socket\n", len, len / PAGE_SIZE);
+	int val = on ? 1 : 0;
+	if (setsockopt(sk, SOL_TCP, TCP_CORK, &val, sizeof(val)))
+		pr_pwarn("Unable to set TCP_CORK=%d", val);
+}
 
-	if (splice(p, NULL, xfer->sk, NULL, len, SPLICE_F_MOVE) != len) {
-		pr_perror("Can't write pages to socket");
-		return -1;
+static void tcp_nodelay(int sk, bool on)
+{
+	int val = on ? 1 : 0;
+	if (setsockopt(sk, SOL_TCP, TCP_NODELAY, &val, sizeof(val)))
+		pr_pwarn("Unable to set TCP_NODELAY=%d", val);
+}
+
+/* page-server xfer */
+static int write_pages_to_server(struct page_xfer *xfer, int p, unsigned long len)
+{
+	ssize_t ret, left = len;
+
+	if (opts.tls) {
+		pr_debug("Sending %lu bytes / %lu pages\n", len, len / PAGE_SIZE);
+
+		if (tls_send_data_from_fd(p, len))
+			return -1;
+	} else {
+		pr_debug("Splicing %lu bytes / %lu pages into socket\n", len, len / PAGE_SIZE);
+
+		while (left > 0) {
+			ret = splice(p, NULL, xfer->sk, NULL, left, SPLICE_F_MOVE);
+			if (ret < 0) {
+				pr_perror("Can't write pages to socket");
+				return -1;
+			}
+
+			pr_debug("\tSpliced: %lu bytes sent\n", (unsigned long)ret);
+			left -= ret;
+		}
 	}
 
 	return 0;
@@ -197,20 +240,19 @@ static int open_page_server_xfer(struct page_xfer *xfer, int fd_type, unsigned l
 	/* Push the command NOW */
 	tcp_nodelay(xfer->sk, true);
 
-	if (read(xfer->sk, &has_parent, 1) != 1) {
+	if (__recv(xfer->sk, &has_parent, 1, 0) != 1) {
 		pr_perror("The page server doesn't answer");
 		return -1;
 	}
 
 	if (has_parent)
-		xfer->parent = (void *) 1; /* This is required for generate_iovs() */
+		xfer->parent = (void *)1; /* This is required for generate_iovs() */
 
 	return 0;
 }
 
 /* local xfer */
-static int write_pages_loc(struct page_xfer *xfer,
-		int p, unsigned long len)
+static int write_pages_loc(struct page_xfer *xfer, int p, unsigned long len)
 {
 	ssize_t ret;
 	ssize_t curr = 0;
@@ -258,7 +300,7 @@ static int check_pagehole_in_parent(struct page_read *p, struct iovec *iov)
 			return -1;
 		}
 
-		pr_debug("\tFound %"PRIx64"/%lu\n", p->pe->vaddr, pagemap_len(p->pe));
+		pr_debug("\tFound %" PRIx64 "/%lu\n", p->pe->vaddr, pagemap_len(p->pe));
 
 		/*
 		 * The pagemap entry in parent may happen to be
@@ -287,8 +329,7 @@ static int write_pagemap_loc(struct page_xfer *xfer, struct iovec *iov, u32 flag
 
 	if (flags & PE_PRESENT) {
 		if (opts.auto_dedup && xfer->parent != NULL) {
-			ret = dedup_one_iovec(xfer->parent, pe.vaddr,
-					      pagemap_len(&pe));
+			ret = dedup_one_iovec(xfer->parent, pe.vaddr, pagemap_len(&pe));
 			if (ret == -1) {
 				pr_perror("Auto-deduplication failed");
 				return ret;
@@ -298,8 +339,7 @@ static int write_pagemap_loc(struct page_xfer *xfer, struct iovec *iov, u32 flag
 		if (xfer->parent != NULL) {
 			ret = check_pagehole_in_parent(xfer->parent, iov);
 			if (ret) {
-				pr_err("Hole %p/%zu not found in parent\n",
-				       iov->iov_base, iov->iov_len);
+				pr_err("Hole %p/%zu not found in parent\n", iov->iov_base, iov->iov_len);
 				return -1;
 			}
 		}
@@ -331,10 +371,8 @@ static int open_page_local_xfer(struct page_xfer *xfer, int fd_type, unsigned lo
 		return -1;
 
 	xfer->pi = open_pages_image(O_DUMP, xfer->pmi, &pages_id);
-	if (!xfer->pi) {
-		close_image(xfer->pmi);
-		return -1;
-	}
+	if (!xfer->pi)
+		goto err_pmi;
 
 	/*
 	 * Open page-read for parent images (if it exists). It will
@@ -349,14 +387,19 @@ static int open_page_local_xfer(struct page_xfer *xfer, int fd_type, unsigned lo
 		int pfd;
 		int pr_flags = (fd_type == CR_FD_PAGEMAP) ? PR_TASK : PR_SHMEM;
 
-		pfd = openat(get_service_fd(IMG_FD_OFF), CR_PARENT_LINK, O_RDONLY);
-		if (pfd < 0 && errno == ENOENT)
+		/* Image streaming lacks support for incremental images */
+		if (opts.stream)
+			goto out;
+
+		if (open_parent(get_service_fd(IMG_FD_OFF), &pfd))
+			goto err_pi;
+		if (pfd < 0)
 			goto out;
 
 		xfer->parent = xmalloc(sizeof(*xfer->parent));
 		if (!xfer->parent) {
 			close(pfd);
-			return -1;
+			goto err_pi;
 		}
 
 		ret = open_page_read_at(pfd, img_id, xfer->parent, pr_flags);
@@ -375,6 +418,12 @@ out:
 	xfer->write_pages = write_pages_loc;
 	xfer->close = close_page_xfer;
 	return 0;
+
+err_pi:
+	close_image(xfer->pi);
+err_pmi:
+	close_image(xfer->pmi);
+	return -1;
 }
 
 int open_page_xfer(struct page_xfer *xfer, int fd_type, unsigned long img_id)
@@ -388,13 +437,11 @@ int open_page_xfer(struct page_xfer *xfer, int fd_type, unsigned long img_id)
 		return open_page_local_xfer(xfer, fd_type, img_id);
 }
 
-static int page_xfer_dump_hole(struct page_xfer *xfer,
-			       struct iovec *hole, u32 flags)
+static int page_xfer_dump_hole(struct page_xfer *xfer, struct iovec *hole, u32 flags)
 {
 	BUG_ON(hole->iov_base < (void *)xfer->offset);
 	hole->iov_base -= xfer->offset;
-	pr_debug("\th %p [%u]\n", hole->iov_base,
-			(unsigned int)(hole->iov_len / PAGE_SIZE));
+	pr_debug("\th %p [%u]\n", hole->iov_base, (unsigned int)(hole->iov_len / PAGE_SIZE));
 
 	if (xfer->write_pagemap(xfer, hole, flags))
 		return -1;
@@ -414,12 +461,11 @@ static int get_hole_flags(struct page_pipe *pp, int n)
 	return -1;
 }
 
-static int dump_holes(struct page_xfer *xfer, struct page_pipe *pp,
-		      unsigned int *cur_hole, void *limit)
+static int dump_holes(struct page_xfer *xfer, struct page_pipe *pp, unsigned int *cur_hole, void *limit)
 {
 	int ret;
 
-	for (; *cur_hole < pp->free_hole ; (*cur_hole)++) {
+	for (; *cur_hole < pp->free_hole; (*cur_hole)++) {
 		struct iovec hole = pp->holes[*cur_hole];
 		u32 hole_flags;
 
@@ -448,6 +494,386 @@ static inline u32 ppb_xfer_flags(struct page_xfer *xfer, struct page_pipe_buf *p
 		return PE_PRESENT;
 }
 
+/*
+ * Optimized pre-dump algorithm
+ * ==============================
+ *
+ * Note: Please refer man(2) page of process_vm_readv syscall.
+ *
+ * The following discussion covers the possibly faulty-iov
+ * locations in an iovec, which hinders process_vm_readv from
+ * dumping the entire iovec in a single invocation.
+ *
+ * Memory layout of target process:
+ *
+ * Pages: A        B        C
+ *	  +--------+--------+--------+--------+--------+--------+
+ *	  |||||||||||||||||||||||||||||||||||||||||||||||||||||||
+ *	  +--------+--------+--------+--------+--------+--------+
+ *
+ * Single "iov" representation: {starting_address, length_in_bytes}
+ * An iovec is array of iov-s.
+ *
+ * NOTE: For easy representation and discussion purpose, we carry
+ *	 out further discussion at "page granularity".
+ *	 length_in_bytes will represent page count in iov instead
+ *	 of byte count. Same assumption applies for the syscall's
+ *	 return value. Instead of returning the number of bytes
+ *	 read, it returns a page count.
+ *
+ * For above memory mapping, generated iovec: {A,1}{B,1}{C,4}
+ *
+ * This iovec remains unmodified once generated. At the same
+ * time some of memory regions listed in iovec may get modified
+ * (unmap/change protection) by the target process while syscall
+ * is trying to dump iovec regions.
+ *
+ * Case 1:
+ *	A is unmapped, {A,1} become faulty iov
+ *
+ *      A        B        C
+ *      +--------+--------+--------+--------+--------+--------+
+ *      |        ||||||||||||||||||||||||||||||||||||||||||||||
+ *      +--------+--------+--------+--------+--------+--------+
+ *      ^        ^
+ *      |        |
+ *      start    |
+ *      (1)      |
+ *               start
+ *               (2)
+ *
+ *	process_vm_readv will return -1. Increment start pointer(2),
+ *	syscall will process {B,1}{C,4} in one go and copy 5 pages
+ *	to userbuf from iov-B and iov-C.
+ *
+ * Case 2:
+ *	B is unmapped, {B,1} become faulty iov
+ *
+ *      A        B        C
+ *      +--------+--------+--------+--------+--------+--------+
+ *      |||||||||         |||||||||||||||||||||||||||||||||||||
+ *      +--------+--------+--------+--------+--------+--------+
+ *      ^                 ^
+ *      |                 |
+ *      start             |
+ *      (1)               |
+ *                        start
+ *                        (2)
+ *
+ *	process_vm_readv will return 1, i.e. page A copied to
+ *	userbuf successfully and syscall stopped, since B got
+ *	unmapped.
+ *
+ *	Increment the start pointer to C(2) and invoke syscall.
+ *	Userbuf contains 5 pages overall from iov-A and iov-C.
+ *
+ * Case 3:
+ *	This case deals with partial unmapping of iov representing
+ *	more than one pagesize region.
+ *
+ *	Syscall can't process such faulty iov as whole. So we
+ *	process such regions part-by-part and form new sub-iovs
+ *	in aux_iov from successfully processed pages.
+ *
+ *
+ *	Part 3.1:
+ *		First page of C is unmapped
+ *
+ *      A        B        C
+ *      +--------+--------+--------+--------+--------+--------+
+ *      ||||||||||||||||||         ||||||||||||||||||||||||||||
+ *      +--------+--------+--------+--------+--------+--------+
+ *      ^                          ^
+ *      |                          |
+ *      start                      |
+ *      (1)                        |
+ *                                 dummy
+ *                                 (2)
+ *
+ *	process_vm_readv will return 2, i.e. pages A and B copied.
+ *	We identify length of iov-C is more than 1 page, that is
+ *	where this case differs from Case 2.
+ *
+ *	dummy-iov is introduced(2) as: {C+1,3}. dummy-iov can be
+ *	directly placed at next page to failing page. This will copy
+ *	remaining 3 pages from iov-C to userbuf. Finally create
+ *	modified iov entry in aux_iov. Complete aux_iov look like:
+ *
+ *	aux_iov: {A,1}{B,1}{C+1,3}*
+ *
+ *
+ *	Part 3.2:
+ *		In between page of C is unmapped, let's say third
+ *
+ *      A        B        C
+ *      +--------+--------+--------+--------+--------+--------+
+ *      ||||||||||||||||||||||||||||||||||||         ||||||||||
+ *      +--------+--------+--------+--------+--------+--------+
+ *      ^                                            ^
+ *      |                 |-----------------|        |
+ *      start              partial_read_bytes        |
+ *      (1)                                          |
+ *                                                   dummy
+ *                                                   (2)
+ *
+ *	process_vm_readv will return 4, i.e. pages A and B copied
+ *	completely and first two pages of C are also copied.
+ *
+ *	Since, iov-C is not processed completely, we need to find
+ *	"partial_read_byte" count to place out dummy-iov for
+ *	remaining processing of iov-C. This function is performed by
+ *	analyze_iov function.
+ *
+ *	dummy-iov will be(2): {C+3,1}. dummy-iov will be placed
+ *	next to first failing address to process remaining iov-C.
+ *	New entries in aux_iov will look like:
+ *
+ *	aux_iov: {A,1}{B,1}{C,2}*{C+3,1}*
+ */
+
+unsigned long handle_faulty_iov(int pid, struct iovec *riov, unsigned long faulty_index, struct iovec *bufvec,
+				struct iovec *aux_iov, unsigned long *aux_len)
+{
+	struct iovec dummy;
+	ssize_t bytes_read;
+	unsigned long final_read_cnt = 0;
+
+	/* Handling Case 3-Part 3.2*/
+	dummy.iov_base = riov[faulty_index].iov_base;
+	dummy.iov_len = riov[faulty_index].iov_len;
+
+	while (dummy.iov_len) {
+		bytes_read = process_vm_readv(pid, bufvec, 1, &dummy, 1, 0);
+		if (bytes_read == -1) {
+			/* Handling faulty page read in faulty iov */
+			cnt_sub(CNT_PAGES_WRITTEN, 1);
+			dummy.iov_base += PAGE_SIZE;
+			dummy.iov_len -= PAGE_SIZE;
+			continue;
+		}
+
+		/* If aux-iov can merge and expand or new entry required */
+		if (aux_iov[(*aux_len) - 1].iov_base + aux_iov[(*aux_len) - 1].iov_len == dummy.iov_base)
+			aux_iov[(*aux_len) - 1].iov_len += bytes_read;
+		else {
+			aux_iov[*aux_len].iov_base = dummy.iov_base;
+			aux_iov[*aux_len].iov_len = bytes_read;
+			(*aux_len) += 1;
+		}
+
+		dummy.iov_base += bytes_read;
+		dummy.iov_len -= bytes_read;
+		bufvec->iov_base += bytes_read;
+		bufvec->iov_len -= bytes_read;
+		final_read_cnt += bytes_read;
+	}
+
+	return final_read_cnt;
+}
+
+/*
+ * This function will position start pointer to the latest
+ * successfully read iov in iovec.
+ */
+static unsigned long analyze_iov(ssize_t bytes_read, struct iovec *riov, unsigned long *index, struct iovec *aux_iov,
+				 unsigned long *aux_len)
+{
+	ssize_t processed_bytes = 0;
+
+	/* correlating iovs with read bytes */
+	while (processed_bytes < bytes_read) {
+		processed_bytes += riov[*index].iov_len;
+		aux_iov[*aux_len].iov_base = riov[*index].iov_base;
+		aux_iov[*aux_len].iov_len = riov[*index].iov_len;
+
+		(*aux_len) += 1;
+		(*index) += 1;
+	}
+
+	/* handling partially processed faulty iov*/
+	if (processed_bytes - bytes_read) {
+		unsigned long partial_read_bytes = 0;
+
+		(*index) -= 1;
+
+		partial_read_bytes = riov[*index].iov_len - (processed_bytes - bytes_read);
+		aux_iov[*aux_len - 1].iov_len = partial_read_bytes;
+		riov[*index].iov_base += partial_read_bytes;
+		riov[*index].iov_len -= partial_read_bytes;
+	}
+
+	return 0;
+}
+
+/*
+ * This function iterates over complete ppb->iov entries and pass
+ * them to process_vm_readv syscall.
+ *
+ * Since process_vm_readv returns count of successfully read bytes.
+ * It does not point to iovec entry associated to last successful
+ * byte read. The correlation between bytes read and corresponding
+ * iovec is setup through analyze_iov function.
+ *
+ * If all iovecs are not processed in one go, it means there exists
+ * some faulty iov entry(memory mapping modified after it was grabbed)
+ * in iovec. process_vm_readv syscall stops at such faulty iov and
+ * skip processing further any entry in iovec. This is handled by
+ * handle_faulty_iov function.
+ */
+static long fill_userbuf(int pid, struct page_pipe_buf *ppb, struct iovec *bufvec, struct iovec *aux_iov,
+			 unsigned long *aux_len)
+{
+	struct iovec *riov = ppb->iov;
+	ssize_t bytes_read;
+	unsigned long total_read = 0;
+	unsigned long start = 0;
+
+	while (start < ppb->nr_segs) {
+		bytes_read = process_vm_readv(pid, bufvec, 1, &riov[start], ppb->nr_segs - start, 0);
+		if (bytes_read == -1) {
+			if (errno == ESRCH) {
+				pr_debug("Target process PID:%d not found\n", pid);
+				return -ESRCH;
+			}
+			if (errno != EFAULT) {
+				pr_perror("process_vm_readv failed");
+				return -1;
+			}
+			/* Handling Case 1*/
+			if (riov[start].iov_len == PAGE_SIZE) {
+				cnt_sub(CNT_PAGES_WRITTEN, 1);
+				start += 1;
+				continue;
+			}
+			total_read += handle_faulty_iov(pid, riov, start, bufvec, aux_iov, aux_len);
+			start += 1;
+			continue;
+		}
+
+		if (bytes_read > 0) {
+			if (analyze_iov(bytes_read, riov, &start, aux_iov, aux_len) < 0)
+				return -1;
+			bufvec->iov_base += bytes_read;
+			bufvec->iov_len -= bytes_read;
+			total_read += bytes_read;
+		}
+	}
+
+	return total_read;
+}
+
+/*
+ * This function is similar to page_xfer_dump_pages, instead it uses
+ * auxiliary_iov array for pagemap generation.
+ *
+ * The entries of ppb->iov may mismatch with actual process mappings
+ * present at time of pre-dump. Such entries need to be adjusted as per
+ * the pages read by process_vm_readv syscall. These adjusted entries
+ * along with unmodified entries are present in aux_iov array.
+ */
+
+int page_xfer_predump_pages(int pid, struct page_xfer *xfer, struct page_pipe *pp)
+{
+	struct page_pipe_buf *ppb;
+	unsigned int cur_hole = 0, i;
+	unsigned long ret, bytes_read;
+	unsigned long userbuf_len;
+	struct iovec bufvec;
+
+	struct iovec *aux_iov;
+	unsigned long aux_len;
+	void *userbuf;
+
+	userbuf_len = PIPE_MAX_BUFFER_SIZE;
+	userbuf = mmap(NULL, userbuf_len, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+	if (userbuf == MAP_FAILED) {
+		pr_perror("Unable to mmap a buffer");
+		return -1;
+	}
+	aux_iov = xmalloc(userbuf_len / PAGE_SIZE * sizeof(aux_iov[0]));
+	if (!aux_iov)
+		goto err;
+
+	list_for_each_entry(ppb, &pp->bufs, l) {
+		if (ppb->pipe_size * PAGE_SIZE > userbuf_len) {
+			void *addr;
+
+			addr = mremap(userbuf, userbuf_len, ppb->pipe_size * PAGE_SIZE, MREMAP_MAYMOVE);
+			if (addr == MAP_FAILED) {
+				pr_perror("Unable to mmap a buffer");
+				goto err;
+			}
+			userbuf_len = ppb->pipe_size * PAGE_SIZE;
+			userbuf = addr;
+			addr = xrealloc(aux_iov, ppb->pipe_size * sizeof(aux_iov[0]));
+			if (!addr)
+				goto err;
+			aux_iov = addr;
+		}
+		timing_start(TIME_MEMDUMP);
+
+		aux_len = 0;
+		bufvec.iov_len = userbuf_len;
+		bufvec.iov_base = userbuf;
+
+		bytes_read = fill_userbuf(pid, ppb, &bufvec, aux_iov, &aux_len);
+		if (bytes_read == -ESRCH) {
+			timing_stop(TIME_MEMDUMP);
+			munmap(userbuf, userbuf_len);
+			xfree(aux_iov);
+			return 0;
+		}
+		if (bytes_read < 0)
+			goto err;
+
+		bufvec.iov_base = userbuf;
+		bufvec.iov_len = bytes_read;
+		ret = vmsplice(ppb->p[1], &bufvec, 1, SPLICE_F_NONBLOCK | SPLICE_F_GIFT);
+
+		if (ret == -1 || ret != bytes_read) {
+			pr_err("vmsplice: Failed to splice user buffer to pipe %ld\n", ret);
+			goto err;
+		}
+
+		timing_stop(TIME_MEMDUMP);
+		timing_start(TIME_MEMWRITE);
+
+		/* generating pagemap */
+		for (i = 0; i < aux_len; i++) {
+			struct iovec iov = aux_iov[i];
+			u32 flags;
+
+			ret = dump_holes(xfer, pp, &cur_hole, iov.iov_base);
+			if (ret)
+				goto err;
+
+			BUG_ON(iov.iov_base < (void *)xfer->offset);
+			iov.iov_base -= xfer->offset;
+			pr_debug("\t p %p [%u]\n", iov.iov_base, (unsigned int)(iov.iov_len / PAGE_SIZE));
+
+			flags = ppb_xfer_flags(xfer, ppb);
+
+			if (xfer->write_pagemap(xfer, &iov, flags))
+				goto err;
+
+			if (xfer->write_pages(xfer, ppb->p[0], iov.iov_len))
+				goto err;
+		}
+
+		timing_stop(TIME_MEMWRITE);
+	}
+
+	munmap(userbuf, userbuf_len);
+	xfree(aux_iov);
+	timing_start(TIME_MEMWRITE);
+
+	return dump_holes(xfer, pp, &cur_hole, NULL);
+err:
+	munmap(userbuf, userbuf_len);
+	xfree(aux_iov);
+	return -1;
+}
+
 int page_xfer_dump_pages(struct page_xfer *xfer, struct page_pipe *pp)
 {
 	struct page_pipe_buf *ppb;
@@ -471,15 +897,13 @@ int page_xfer_dump_pages(struct page_xfer *xfer, struct page_pipe *pp)
 
 			BUG_ON(iov.iov_base < (void *)xfer->offset);
 			iov.iov_base -= xfer->offset;
-			pr_debug("\tp %p [%u]\n", iov.iov_base,
-					(unsigned int)(iov.iov_len / PAGE_SIZE));
+			pr_debug("\tp %p [%u]\n", iov.iov_base, (unsigned int)(iov.iov_len / PAGE_SIZE));
 
 			flags = ppb_xfer_flags(xfer, ppb);
 
 			if (xfer->write_pagemap(xfer, &iov, flags))
 				return -1;
-			if ((flags & PE_PRESENT) && xfer->write_pages(xfer,
-						ppb->p[0], iov.iov_len))
+			if ((flags & PE_PRESENT) && xfer->write_pages(xfer, ppb->p[0], iov.iov_len))
 				return -1;
 		}
 	}
@@ -499,8 +923,13 @@ int check_parent_local_xfer(int fd_type, unsigned long img_id)
 	struct stat st;
 	int ret, pfd;
 
-	pfd = openat(get_service_fd(IMG_FD_OFF), CR_PARENT_LINK, O_RDONLY);
-	if (pfd < 0 && errno == ENOENT)
+	/* Image streaming lacks support for incremental images */
+	if (opts.stream)
+		return 0;
+
+	if (open_parent(get_service_fd(IMG_FD_OFF), &pfd))
+		return -1;
+	if (pfd < 0)
 		return 0;
 
 	snprintf(path, sizeof(path), imgset_template[fd_type].fmt, img_id);
@@ -531,7 +960,7 @@ static int page_server_check_parent(int sk, struct page_server_iov *pi)
 	if (ret < 0)
 		return -1;
 
-	if (write(sk, &ret, sizeof(ret)) != sizeof(ret)) {
+	if (__send(sk, &ret, sizeof(ret), 0) != sizeof(ret)) {
 		pr_perror("Unable to send response");
 		return -1;
 	}
@@ -552,7 +981,7 @@ static int check_parent_server_xfer(int fd_type, unsigned long img_id)
 
 	tcp_nodelay(page_server_sk, true);
 
-	if (read(page_server_sk, &has_parent, sizeof(int)) != sizeof(int)) {
+	if (__recv(page_server_sk, &has_parent, sizeof(int), 0) != sizeof(int)) {
 		pr_perror("The page server doesn't answer");
 		return -1;
 	}
@@ -569,8 +998,8 @@ int check_parent_page_xfer(int fd_type, unsigned long img_id)
 }
 
 struct page_xfer_job {
-	u64	dst_id;
-	int	p[2];
+	u64 dst_id;
+	int p[2];
 	unsigned pipe_size;
 	struct page_xfer loc_xfer;
 };
@@ -616,8 +1045,7 @@ static int page_server_open(int sk, struct page_server_iov *pi)
 
 	if (sk >= 0) {
 		char has_parent = !!cxfer.loc_xfer.parent;
-
-		if (write(sk, &has_parent, 1) != 1) {
+		if (__send(sk, &has_parent, 1, 0) != 1) {
 			pr_perror("Unable to send response");
 			close_page_xfer(&cxfer.loc_xfer);
 			return -1;
@@ -642,7 +1070,7 @@ static int page_server_add(int sk, struct page_server_iov *pi, u32 flags)
 	struct page_xfer *lxfer = &cxfer.loc_xfer;
 	struct iovec iov;
 
-	pr_debug("Adding %"PRIx64"/%u\n", pi->vaddr, pi->nr_pages);
+	pr_debug("Adding %" PRIx64 "/%u\n", pi->vaddr, pi->nr_pages);
 
 	if (prep_loc_xfer(pi))
 		return -1;
@@ -676,14 +1104,22 @@ static int page_server_add(int sk, struct page_server_iov *pi, u32 flags)
 			return -1;
 		}
 
-		chunk = splice(sk, NULL, cxfer.p[1], NULL, chunk, SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
-		if (chunk < 0) {
-			pr_perror("Can't read from socket");
-			return -1;
-		}
-		if (chunk == 0) {
-			pr_err("A socket was closed unexpectedly\n");
-			return -1;
+		if (opts.tls) {
+			if (tls_recv_data_to_fd(cxfer.p[1], chunk)) {
+				pr_err("Can't read from socket\n");
+				return -1;
+			}
+		} else {
+			chunk = splice(sk, NULL, cxfer.p[1], NULL, chunk, SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
+
+			if (chunk < 0) {
+				pr_perror("Can't read from socket");
+				return -1;
+			}
+			if (chunk == 0) {
+				pr_err("A socket was closed unexpectedly\n");
+				return -1;
+			}
 		}
 
 		if (lxfer->write_pages(lxfer, cxfer.p[0], chunk))
@@ -705,8 +1141,7 @@ static int page_server_get_pages(int sk, struct page_server_iov *pi)
 	item = pstree_item_by_virt(pi->dst_id);
 	pp = dmpi(item)->mem_pp;
 
-	ret = page_pipe_read(pp, &pipe_read_dest, pi->vaddr,
-			     &pi->nr_pages, PPB_LAZY);
+	ret = page_pipe_read(pp, &pipe_read_dest, pi->vaddr, &pi->nr_pages, PPB_LAZY);
 	if (ret)
 		return ret;
 
@@ -725,9 +1160,15 @@ static int page_server_get_pages(int sk, struct page_server_iov *pi)
 		return -1;
 
 	len = pi->nr_pages * PAGE_SIZE;
-	ret = splice(pipe_read_dest.p[0], NULL, sk, NULL, len, SPLICE_F_MOVE);
-	if (ret != len)
-		return -1;
+
+	if (opts.tls) {
+		if (tls_send_data_from_fd(pipe_read_dest.p[0], len))
+			return -1;
+	} else {
+		ret = splice(pipe_read_dest.p[0], NULL, sk, NULL, len, SPLICE_F_MOVE);
+		if (ret != len)
+			return -1;
+	}
 
 	tcp_nodelay(sk, true);
 
@@ -765,7 +1206,7 @@ static int page_server_serve(int sk)
 		struct page_server_iov pi;
 		u32 cmd;
 
-		ret = recv(sk, &pi, sizeof(pi), MSG_WAITALL);
+		ret = __recv(sk, &pi, sizeof(pi), MSG_WAITALL);
 		if (!ret)
 			break;
 
@@ -790,23 +1231,21 @@ static int page_server_serve(int sk)
 			break;
 		case PS_IOV_ADD_F:
 		case PS_IOV_ADD:
-		case PS_IOV_HOLE:
-		{
+		case PS_IOV_HOLE: {
 			u32 flags;
 
 			if (likely(cmd == PS_IOV_ADD_F))
 				flags = decode_ps_flags(pi.cmd);
 			else if (cmd == PS_IOV_ADD)
 				flags = PE_PRESENT;
-			else    /* PS_IOV_HOLE */
+			else /* PS_IOV_HOLE */
 				flags = PE_PARENT;
 
 			ret = page_server_add(sk, &pi, flags);
 			break;
 		}
-		case PS_IOV_FLUSH:
-		case PS_IOV_FLUSH_N_CLOSE:
-		{
+		case PS_IOV_CLOSE:
+		case PS_IOV_FORCE_CLOSE: {
 			int32_t status = 0;
 
 			ret = 0;
@@ -815,7 +1254,7 @@ static int page_server_serve(int sk)
 			 * An answer must be sent back to inform another side,
 			 * that all data were received
 			 */
-			if (write(sk, &status, sizeof(status)) != sizeof(status)) {
+			if (__send(sk, &status, sizeof(status), 0) != sizeof(status)) {
 				pr_perror("Can't send the final package");
 				ret = -1;
 			}
@@ -832,7 +1271,9 @@ static int page_server_serve(int sk)
 			break;
 		}
 
-		if (ret || (pi.cmd == PS_IOV_FLUSH_N_CLOSE))
+		if (ret)
+			break;
+		if (pi.cmd == PS_IOV_CLOSE || pi.cmd == PS_IOV_FORCE_CLOSE)
 			break;
 	}
 
@@ -841,6 +1282,8 @@ static int page_server_serve(int sk)
 		ret = -1;
 	}
 
+	tls_terminate_session(ret != 0);
+
 	if (ret == 0 && opts.ps_socket == -1) {
 		char c;
 
@@ -848,7 +1291,6 @@ static int page_server_serve(int sk)
 		 * Wait when a remote side closes the connection
 		 * to avoid TIME_WAIT bucket
 		 */
-
 		if (read(sk, &c, sizeof(c)) != 0) {
 			pr_perror("Unexpected data");
 			ret = -1;
@@ -856,6 +1298,7 @@ static int page_server_serve(int sk)
 	}
 
 	page_server_close();
+
 	pr_info("Session over\n");
 
 	close(sk);
@@ -888,8 +1331,8 @@ static int fill_page_pipe(struct page_read *pr, struct page_pipe *pp)
 		for (i = 0; i < ppb->nr_segs; i++) {
 			struct iovec iov = ppb->iov[i];
 
-			if (splice(img_raw_fd(pr->pi), NULL, ppb->p[1], NULL,
-				   iov.iov_len, SPLICE_F_MOVE) != iov.iov_len) {
+			if (splice(img_raw_fd(pr->pi), NULL, ppb->p[1], NULL, iov.iov_len, SPLICE_F_MOVE) !=
+			    iov.iov_len) {
 				pr_perror("Splice failed");
 				return -1;
 			}
@@ -977,19 +1420,18 @@ int cr_page_server(bool daemon_mode, bool lazy_dump, int cfd)
 			return -1;
 
 	if (opts.ps_socket != -1) {
-		ret = 0;
 		ask = opts.ps_socket;
 		pr_info("Re-using ps socket %d\n", ask);
 		goto no_server;
 	}
 
-	sk = setup_tcp_server("page");
+	sk = setup_tcp_server("page", opts.addr, &opts.port);
 	if (sk == -1)
 		return -1;
 no_server:
 
 	if (!daemon_mode && cfd >= 0) {
-		struct ps_info info = {.pid = getpid(), .port = opts.port};
+		struct ps_info info = { .pid = getpid(), .port = opts.port };
 		int count;
 
 		count = write(cfd, &info, sizeof(info));
@@ -1003,6 +1445,11 @@ no_server:
 	ret = run_tcp_server(daemon_mode, &ask, cfd, sk);
 	if (ret != 0)
 		return ret > 0 ? 0 : -1;
+
+	if (tls_x509_init(ask, true)) {
+		close_safe(&sk);
+		return -1;
+	}
 
 	if (ask >= 0)
 		ret = page_server_serve(ask);
@@ -1027,6 +1474,11 @@ static int connect_to_page_server(void)
 	page_server_sk = setup_tcp_client(opts.addr);
 	if (page_server_sk == -1)
 		return -1;
+
+	if (tls_x509_init(page_server_sk, false)) {
+		close(page_server_sk);
+		return -1;
+	}
 out:
 	/*
 	 * CORK the socket at the very beginning. As per ANK
@@ -1044,7 +1496,7 @@ int connect_to_page_server_to_send(void)
 
 int disconnect_from_page_server(void)
 {
-	struct page_server_iov pi = { };
+	struct page_server_iov pi = {};
 	int32_t status = -1;
 	int ret = -1;
 
@@ -1054,8 +1506,7 @@ int disconnect_from_page_server(void)
 	if (page_server_sk == -1)
 		return 0;
 
-	pr_info("Disconnect from the page server %s:%u\n",
-			opts.addr, (int)ntohs(opts.port));
+	pr_info("Disconnect from the page server\n");
 
 	if (opts.ps_socket != -1)
 		/*
@@ -1063,22 +1514,24 @@ int disconnect_from_page_server(void)
 		 * the parent process) so we must order the
 		 * page-server to terminate itself.
 		 */
-		pi.cmd = PS_IOV_FLUSH_N_CLOSE;
+		pi.cmd = PS_IOV_FORCE_CLOSE;
 	else
-		pi.cmd = PS_IOV_FLUSH;
+		pi.cmd = PS_IOV_CLOSE;
 
 	if (send_psi(page_server_sk, &pi))
 		goto out;
 
-	if (read(page_server_sk, &status, sizeof(status)) != sizeof(status)) {
+	if (__recv(page_server_sk, &status, sizeof(status), 0) != sizeof(status)) {
 		pr_perror("The page server doesn't answer");
 		goto out;
 	}
 
 	ret = 0;
 out:
+	tls_terminate_session(ret != 0);
 	close_safe(&page_server_sk);
-	return ret ? : status;
+
+	return ret ?: status;
 }
 
 struct ps_async_read {
@@ -1103,8 +1556,8 @@ static inline void async_read_set_goal(struct ps_async_read *ar, int nr_pages)
 	ar->nr_pages = nr_pages;
 }
 
-static void init_ps_async_read(struct ps_async_read *ar, void *buf,
-		int nr_pages, ps_async_read_complete complete, void *priv)
+static void init_ps_async_read(struct ps_async_read *ar, void *buf, int nr_pages, ps_async_read_complete complete,
+			       void *priv)
 {
 	ar->pages = buf;
 	ar->rb = 0;
@@ -1113,8 +1566,7 @@ static void init_ps_async_read(struct ps_async_read *ar, void *buf,
 	async_read_set_goal(ar, nr_pages);
 }
 
-static int page_server_start_async_read(void *buf, int nr_pages,
-		ps_async_read_complete complete, void *priv)
+static int page_server_start_async_read(void *buf, int nr_pages, ps_async_read_complete complete, void *priv)
 {
 	struct ps_async_read *ar;
 
@@ -1154,10 +1606,14 @@ static int page_server_read(struct ps_async_read *ar, int flags)
 		need = ar->goal - ar->rb;
 	}
 
-	ret = recv(page_server_sk, buf, need, flags);
+	ret = __recv(page_server_sk, buf, need, flags);
 	if (ret < 0) {
-		pr_perror("Error reading async data from page server");
-		return -1;
+		if (flags == MSG_DONTWAIT && (errno == EAGAIN || errno == EINTR)) {
+			ret = 0;
+		} else {
+			pr_perror("Error reading data from page server");
+			return -1;
+		}
 	}
 
 	ar->rb += ret;
@@ -1168,8 +1624,7 @@ static int page_server_read(struct ps_async_read *ar, int flags)
 	 * IO complete -- notify the caller and drop the request
 	 */
 	BUG_ON(ar->rb > ar->goal);
-	return ar->complete((int)ar->pi.dst_id, (unsigned long)ar->pi.vaddr,
-				(int)ar->pi.nr_pages, ar->priv);
+	return ar->complete((int)ar->pi.dst_id, (unsigned long)ar->pi.vaddr, (int)ar->pi.nr_pages, ar->priv);
 }
 
 static int page_server_async_read(struct epoll_rfd *f)
@@ -1214,10 +1669,10 @@ int connect_to_page_server_to_recv(int epfd)
 int request_remote_pages(unsigned long img_id, unsigned long addr, int nr_pages)
 {
 	struct page_server_iov pi = {
-		.cmd		= PS_IOV_GET,
-		.nr_pages	= nr_pages,
-		.vaddr		= addr,
-		.dst_id		= img_id,
+		.cmd = PS_IOV_GET,
+		.nr_pages = nr_pages,
+		.vaddr = addr,
+		.dst_id = img_id,
 	};
 
 	/* XXX: why MSG_DONTWAIT here? */
@@ -1228,8 +1683,7 @@ int request_remote_pages(unsigned long img_id, unsigned long addr, int nr_pages)
 	return 0;
 }
 
-static int page_server_start_sync_read(void *buf, int nr,
-		ps_async_read_complete complete, void *priv)
+static int page_server_start_sync_read(void *buf, int nr, ps_async_read_complete complete, void *priv)
 {
 	struct ps_async_read ar;
 	int ret = 1;
@@ -1240,8 +1694,7 @@ static int page_server_start_sync_read(void *buf, int nr,
 	return ret;
 }
 
-int page_server_start_read(void *buf, int nr,
-		ps_async_read_complete complete, void *priv, unsigned flags)
+int page_server_start_read(void *buf, int nr, ps_async_read_complete complete, void *priv, unsigned flags)
 {
 	if (flags & PR_ASYNC)
 		return page_server_start_async_read(buf, nr, complete, priv);

@@ -16,6 +16,8 @@
 #include <sched.h>
 #include <sys/resource.h>
 #include <signal.h>
+#include <sys/inotify.h>
+#include <sys/socket.h>
 
 #include "linux/userfaultfd.h"
 
@@ -34,28 +36,54 @@
 #include "sk-inet.h"
 #include "vma.h"
 #include "uffd.h"
+#include "sched.h"
 
 #include "common/lock.h"
+#include "common/page.h"
 #include "restorer.h"
 #include "aio.h"
 #include "seccomp.h"
 
 #include "images/creds.pb-c.h"
 #include "images/mm.pb-c.h"
+#include "images/inventory.pb-c.h"
 
 #include "shmem.h"
 #include "restorer.h"
+
+/*
+ * sys_getgroups() buffer size. Not too much, to avoid stack overflow.
+ */
+#define MAX_GETGROUPS_CHECKED (512 / sizeof(unsigned int))
+
+/*
+ * Memory overhead limit for reading VMA when auto_dedup is enabled.
+ * An arbitrarily chosen trade-off point between speed and memory usage.
+ */
+#define AUTO_DEDUP_OVERHEAD_BYTES (128 << 20)
 
 #ifndef PR_SET_PDEATHSIG
 #define PR_SET_PDEATHSIG 1
 #endif
 
-#define sys_prctl_safe(opcode, val1, val2, val3)			\
-	({								\
-		long __ret = sys_prctl(opcode, val1, val2, val3, 0);	\
-		if (__ret)						\
-			 pr_err("prctl failed @%d with %ld\n", __LINE__, __ret);\
-		__ret;							\
+#ifndef PR_SET_CHILD_SUBREAPER
+#define PR_SET_CHILD_SUBREAPER 36
+#endif
+
+#ifndef FALLOC_FL_KEEP_SIZE
+#define FALLOC_FL_KEEP_SIZE 0x01
+#endif
+
+#ifndef FALLOC_FL_PUNCH_HOLE
+#define FALLOC_FL_PUNCH_HOLE 0x02
+#endif
+
+#define sys_prctl_safe(opcode, val1, val2, val3)                                \
+	({                                                                      \
+		long __ret = sys_prctl(opcode, val1, val2, val3, 0);            \
+		if (__ret)                                                      \
+			pr_err("prctl failed @%d with %ld\n", __LINE__, __ret); \
+		__ret;                                                          \
 	})
 
 static struct task_entries *task_entries_local;
@@ -69,6 +97,18 @@ bool fault_injected(enum faults f)
 {
 	return __fault_injected(f, fi_strategy);
 }
+
+#ifdef ARCH_HAS_LONG_PAGES
+/*
+ * XXX: Make it compel's std plugin global variable. Drop parasite_size().
+ * Hint: compel on aarch64 shall learn relocs for that.
+ */
+static unsigned __page_size;
+unsigned long page_size(void)
+{
+	return __page_size;
+}
+#endif
 
 /*
  * These are stubs for std compel plugin.
@@ -87,8 +127,7 @@ void parasite_cleanup(void)
 {
 }
 
-extern void cr_restore_rt (void) asm ("__cr_restore_rt")
-			__attribute__ ((visibility ("hidden")));
+extern void cr_restore_rt(void) asm("__cr_restore_rt") __attribute__((visibility("hidden")));
 
 static void sigchld_handler(int signal, siginfo_t *siginfo, void *data)
 {
@@ -126,7 +165,7 @@ static void sigchld_handler(int signal, siginfo_t *siginfo, void *data)
 	sys_exit_group(1);
 }
 
-static int lsm_set_label(char *label, int procfd)
+static int lsm_set_label(char *label, char *type, int procfd)
 {
 	int ret = -1, len, lsmfd;
 	char path[STD_LOG_SIMPLE_CHUNK];
@@ -134,9 +173,9 @@ static int lsm_set_label(char *label, int procfd)
 	if (!label)
 		return 0;
 
-	pr_info("restoring lsm profile %s\n", label);
+	pr_info("restoring lsm profile (%s) %s\n", type, label);
 
-	std_sprintf(path, "self/task/%ld/attr/current", sys_gettid());
+	std_sprintf(path, "self/task/%ld/attr/%s", sys_gettid(), type);
 
 	lsmfd = sys_openat(procfd, path, O_WRONLY, 0);
 	if (lsmfd < 0) {
@@ -157,26 +196,45 @@ static int lsm_set_label(char *label, int procfd)
 	return 0;
 }
 
-static int restore_creds(struct thread_creds_args *args, int procfd)
+static int restore_creds(struct thread_creds_args *args, int procfd, int lsm_type, uid_t uid)
 {
 	CredsEntry *ce = &args->creds;
 	int b, i, ret;
 	struct cap_header hdr;
 	struct cap_data data[_LINUX_CAPABILITY_U32S_3];
-
-	/*
-	 * We're still root here and thus can do it without failures.
-	 */
+	int ruid, euid, suid, fsuid;
+	int rgid, egid, sgid, fsgid;
 
 	/*
 	 * Setup supplementary group IDs early.
 	 */
 	if (args->groups) {
-		ret = sys_setgroups(ce->n_groups, args->groups);
-		if (ret) {
-			pr_err("Can't setup supplementary group IDs: %d\n", ret);
-			return -1;
+		/*
+		 * We may be in an unprivileged user namespace where setgroups
+		 * is disabled.  If the current list of groups is already what
+		 * we want, skip the call to setgroups.
+		 */
+		unsigned int gids[MAX_GETGROUPS_CHECKED];
+		int n = sys_getgroups(MAX_GETGROUPS_CHECKED, gids);
+		if (n != ce->n_groups || memcmp(gids, args->groups, n * sizeof(*gids))) {
+			ret = sys_setgroups(ce->n_groups, args->groups);
+			if (ret) {
+				pr_err("Can't setgroups([%zu gids]): %d\n", ce->n_groups, ret);
+				return -1;
+			}
 		}
+	}
+
+	/*
+	 * Compare xids with current values. If all match then we can skip
+	 * setting them (which requires extra capabilities).
+	 */
+	fsuid = sys_setfsuid(-1);
+	fsgid = sys_setfsgid(-1);
+	if (sys_getresuid(&ruid, &euid, &suid) == 0 && sys_getresgid(&rgid, &egid, &sgid) == 0 && ruid == ce->uid &&
+	    euid == ce->euid && suid == ce->suid && rgid == ce->gid && egid == ce->egid && sgid == ce->sgid &&
+	    fsuid == ce->fsuid && fsgid == ce->fsgid) {
+		goto skip_xids;
 	}
 
 	/*
@@ -184,10 +242,12 @@ static int restore_creds(struct thread_creds_args *args, int procfd)
 	 * lose caps bits when changing xids.
 	 */
 
-	ret = sys_prctl(PR_SET_SECUREBITS, 1 << SECURE_NO_SETUID_FIXUP, 0, 0, 0);
-	if (ret) {
-		pr_err("Unable to set SECURE_NO_SETUID_FIXUP: %d\n", ret);
-		return -1;
+	if (!uid) {
+		ret = sys_prctl(PR_SET_SECUREBITS, 1 << SECURE_NO_SETUID_FIXUP, 0, 0, 0);
+		if (ret) {
+			pr_err("Unable to set SECURE_NO_SETUID_FIXUP: %d\n", ret);
+			return -1;
+		}
 	}
 
 	/*
@@ -220,20 +280,23 @@ static int restore_creds(struct thread_creds_args *args, int procfd)
 		return -1;
 	}
 
+skip_xids:
 	/*
 	 * Third -- restore securebits. We don't need them in any
 	 * special state any longer.
 	 */
 
-	ret = sys_prctl(PR_SET_SECUREBITS, ce->secbits, 0, 0, 0);
-	if (ret) {
-		pr_err("Unable to set PR_SET_SECUREBITS: %d\n", ret);
-		return -1;
+	if (sys_prctl(PR_GET_SECUREBITS, 0, 0, 0, 0) != ce->secbits) {
+		ret = sys_prctl(PR_SET_SECUREBITS, ce->secbits, 0, 0, 0);
+		if (ret) {
+			pr_err("Unable to set PR_SET_SECUREBITS: %d\n", ret);
+			return -1;
+		}
 	}
 
 	/*
 	 * Fourth -- trim bset. This can only be done while
-	 * having the CAP_SETPCAP capablity.
+	 * having the CAP_SETPCAP capability.
 	 */
 
 	for (b = 0; b < CR_CAP_SIZE; b++) {
@@ -244,11 +307,18 @@ static int restore_creds(struct thread_creds_args *args, int procfd)
 				/* already set */
 				continue;
 			ret = sys_prctl(PR_CAPBSET_DROP, i + b * 32, 0, 0, 0);
-			if (ret) {
-				pr_err("Unable to drop capability %d: %d\n",
-								i + b * 32, ret);
+			if (!ret)
+				continue;
+			if (!ce->has_no_new_privs || !ce->no_new_privs || args->cap_prm[b] & (1 << i)) {
+				pr_err("Unable to drop capability %d: %d\n", i + b * 32, ret);
 				return -1;
 			}
+			/*
+			 * If prctl(NO_NEW_PRIVS) is going to be set then it
+			 * will prevent inheriting the capabilities not in
+			 * the permitted set.
+			 */
+			pr_warn("Unable to drop capability %d from bset: %d (but NO_NEW_PRIVS will drop it)\n", i + b * 32, ret);
 		}
 	}
 
@@ -274,8 +344,29 @@ static int restore_creds(struct thread_creds_args *args, int procfd)
 		return -1;
 	}
 
-	if (lsm_set_label(args->lsm_profile, procfd) < 0)
+	if (lsm_type != LSMTYPE__SELINUX) {
+		/*
+		 * SELinux does not support setting the process context for
+		 * threaded processes. So this is skipped if running with
+		 * SELinux and instead the process context is set before the
+		 * threads are created.
+		 */
+		if (lsm_set_label(args->lsm_profile, "current", procfd) < 0)
+			return -1;
+	}
+
+	/* Also set the sockcreate label for all threads */
+	if (lsm_set_label(args->lsm_sockcreate, "sockcreate", procfd) < 0)
 		return -1;
+
+	if (ce->has_no_new_privs && ce->no_new_privs) {
+		ret = sys_prctl(PR_SET_NO_NEW_PRIVS, ce->no_new_privs, 0, 0, 0);
+		if (ret) {
+			pr_err("Unable to set no_new_privs=%d: %d\n", ce->no_new_privs, ret);
+			return -1;
+		}
+	}
+
 	return 0;
 }
 
@@ -287,10 +378,18 @@ static int restore_creds(struct thread_creds_args *args, int procfd)
 
 static inline int restore_pdeath_sig(struct thread_restore_args *ta)
 {
-	if (ta->pdeath_sig)
-		return sys_prctl(PR_SET_PDEATHSIG, ta->pdeath_sig, 0, 0, 0);
-	else
+	int ret;
+
+	if (!ta->pdeath_sig)
 		return 0;
+
+	ret = sys_prctl(PR_SET_PDEATHSIG, ta->pdeath_sig, 0, 0, 0);
+	if (ret) {
+		pr_err("Unable to set PR_SET_PDEATHSIG(%d): %d\n", ta->pdeath_sig, ret);
+		return -1;
+	}
+
+	return 0;
 }
 
 static int restore_dumpable_flag(MmEntry *mme)
@@ -335,14 +434,13 @@ static int restore_dumpable_flag(MmEntry *mme)
 
 static void restore_sched_info(struct rst_sched_param *p)
 {
-	struct sched_param parm;
+	struct sched_param param;
 
-	pr_info("Restoring scheduler params %d.%d.%d\n",
-			p->policy, p->nice, p->prio);
+	pr_info("Restoring scheduler params %d.%d.%d\n", p->policy, p->nice, p->prio);
 
 	sys_setpriority(PRIO_PROCESS, 0, p->nice);
-	parm.sched_priority = p->prio;
-	sys_sched_setscheduler(0, p->policy, &parm);
+	param.sched_priority = p->prio;
+	sys_sched_setscheduler(0, p->policy, &param);
 }
 
 static void restore_rlims(struct task_restore_args *ta)
@@ -369,11 +467,9 @@ static int restore_signals(siginfo_t *ptr, int nr, bool group)
 		if (group)
 			ret = sys_rt_sigqueueinfo(sys_getpid(), info->si_signo, info);
 		else
-			ret = sys_rt_tgsigqueueinfo(sys_getpid(),
-						sys_gettid(), info->si_signo, info);
+			ret = sys_rt_tgsigqueueinfo(sys_getpid(), sys_gettid(), info->si_signo, info);
 		if (ret) {
-			pr_err("Unable to send siginfo %d %x with code %d\n",
-					info->si_signo, info->si_code, ret);
+			pr_err("Unable to send siginfo %d %x with code %d\n", info->si_signo, info->si_code, ret);
 			return -1;
 		}
 	}
@@ -381,54 +477,108 @@ static int restore_signals(siginfo_t *ptr, int nr, bool group)
 	return 0;
 }
 
-static int restore_seccomp(struct task_restore_args *args)
+static int restore_rseq(struct rst_rseq_param *rseq)
 {
+	int ret;
+
+	if (!rseq->rseq_abi_pointer) {
+		pr_debug("rseq: nothing to restore\n");
+		return 0;
+	}
+
+	pr_debug("rseq: rseq_abi_pointer = %lx signature = %x\n", (unsigned long)rseq->rseq_abi_pointer,
+		 rseq->signature);
+
+	ret = sys_rseq(decode_pointer(rseq->rseq_abi_pointer), rseq->rseq_abi_size, 0, rseq->signature);
+	if (ret) {
+		pr_err("failed sys_rseq(%lx, %lx, %x, %x) = %d\n", (unsigned long)rseq->rseq_abi_pointer,
+		       (unsigned long)rseq->rseq_abi_size, 0, rseq->signature, ret);
+		return -1;
+	}
+
+	return 0;
+}
+
+static int restore_seccomp_filter(pid_t tid, struct thread_restore_args *args)
+{
+	unsigned int flags = args->seccomp_force_tsync ? SECCOMP_FILTER_FLAG_TSYNC : 0;
+	size_t i;
+	int ret;
+
+	for (i = 0; i < args->seccomp_filters_n; i++) {
+		struct thread_seccomp_filter *filter = &args->seccomp_filters[i];
+
+		pr_debug("seccomp: Restoring mode %d flags %x on tid %d filter %d\n", SECCOMP_SET_MODE_FILTER,
+			 (filter->flags | flags), tid, (int)i);
+
+		ret = sys_seccomp(SECCOMP_SET_MODE_FILTER, filter->flags | flags, (void *)&filter->sock_fprog);
+		if (ret < 0) {
+			if (ret == -ENOSYS) {
+				pr_debug("seccomp: sys_seccomp is not supported in kernel, "
+					 "switching to prctl interface\n");
+				ret = sys_prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, (long)(void *)&filter->sock_fprog,
+						0, 0);
+				if (ret) {
+					pr_err("seccomp: PR_SET_SECCOMP returned %d on tid %d\n", ret, tid);
+					return -1;
+				}
+			} else {
+				pr_err("seccomp: SECCOMP_SET_MODE_FILTER returned %d on tid %d\n", ret, tid);
+				return -1;
+			}
+		}
+	}
+
+	return 0;
+}
+
+static int restore_seccomp(struct thread_restore_args *args)
+{
+	pid_t tid = sys_gettid();
 	int ret;
 
 	switch (args->seccomp_mode) {
 	case SECCOMP_MODE_DISABLED:
+		pr_debug("seccomp: mode %d on tid %d\n", SECCOMP_MODE_DISABLED, tid);
 		return 0;
+		break;
 	case SECCOMP_MODE_STRICT:
+		/*
+		 * Disable gettimeofday() from vdso: it may use TSC
+		 * which is restricted by kernel:
+		 *
+		 * static long seccomp_set_mode_strict(void)
+		 * {
+		 * [..]
+		 * #ifdef TIF_NOTSC
+		 *	disable_TSC();
+		 * #endif
+		 * [..]
+		 *
+		 * XXX: It may need to be fixed in kernel under
+		 * PTRACE_O_SUSPEND_SECCOMP, but for now just get timings
+		 * with a raw syscall instead of vdso.
+		 */
+		std_log_set_gettimeofday(NULL);
 		ret = sys_prctl(PR_SET_SECCOMP, SECCOMP_MODE_STRICT, 0, 0, 0);
 		if (ret < 0) {
-			pr_err("prctl(PR_SET_SECCOMP, SECCOMP_MODE_STRICT) returned %d\n", ret);
-			goto die;
+			pr_err("seccomp: SECCOMP_MODE_STRICT returned %d on tid %d\n", ret, tid);
 		}
-		return 0;
-	case SECCOMP_MODE_FILTER: {
-		int i;
-		void *filter_data;
-
-		filter_data = &args->seccomp_filters[args->seccomp_filters_n];
-
-		for (i = 0; i < args->seccomp_filters_n; i++) {
-			struct sock_fprog *fprog = &args->seccomp_filters[i];
-
-			fprog->filter = filter_data;
-
-			/* We always TSYNC here, since we require that the
-			 * creds for all threads be the same; this means we
-			 * don't have to restore_seccomp() in threads, and that
-			 * future TSYNC behavior will be correct.
-			 */
-			ret = sys_seccomp(SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_TSYNC, (char *) fprog);
-			if (ret < 0) {
-				pr_err("sys_seccomp() returned %d\n", ret);
-				goto die;
-			}
-
-			filter_data += fprog->len * sizeof(struct sock_filter);
-		}
-
-		return 0;
-	}
+		break;
+	case SECCOMP_MODE_FILTER:
+		ret = restore_seccomp_filter(tid, args);
+		break;
 	default:
-		goto die;
+		pr_err("seccomp: Unknown seccomp mode %d on tid %d\n", args->seccomp_mode, tid);
+		ret = -1;
+		break;
 	}
 
-	return 0;
-die:
-	return -1;
+	if (!ret) {
+		pr_debug("seccomp: Restored mode %d on tid %d\n", args->seccomp_mode, tid);
+	}
+
+	return ret;
 }
 
 static int restore_robust_futex(struct thread_restore_args *args)
@@ -473,20 +623,119 @@ static int restore_thread_common(struct thread_restore_args *args)
 
 	restore_tls(&args->tls);
 
+	if (restore_rseq(&args->rseq))
+		return -1;
+
 	return 0;
 }
 
-static void noinline rst_sigreturn(unsigned long new_sp,
-		struct rt_sigframe *sigframe)
+static void noinline rst_sigreturn(unsigned long new_sp, struct rt_sigframe *sigframe)
 {
 	ARCH_RT_SIGRETURN(new_sp, sigframe);
+}
+
+static int send_cg_set(int sk, int cg_set)
+{
+	struct cmsghdr *ch;
+	struct msghdr h;
+	/*
+	 * 0th is the dummy call address for compatibility with userns helper
+	 * 1st is the cg_set
+	 */
+	struct iovec iov[2];
+	char cmsg[CMSG_SPACE(sizeof(struct ucred))] = {};
+	int ret, *dummy = NULL;
+	struct ucred *ucred;
+
+	iov[0].iov_base = &dummy;
+	iov[0].iov_len = sizeof(dummy);
+	iov[1].iov_base = &cg_set;
+	iov[1].iov_len = sizeof(cg_set);
+
+	h.msg_iov = iov;
+	h.msg_iovlen = sizeof(iov) / sizeof(struct iovec);
+	h.msg_name = NULL;
+	h.msg_namelen = 0;
+	h.msg_flags = 0;
+
+	h.msg_control = cmsg;
+	h.msg_controllen = sizeof(cmsg);
+	ch = CMSG_FIRSTHDR(&h);
+	ch->cmsg_len = CMSG_LEN(sizeof(struct ucred));
+	ch->cmsg_level = SOL_SOCKET;
+	ch->cmsg_type = SCM_CREDENTIALS;
+
+	ucred = (struct ucred *)CMSG_DATA(ch);
+	/*
+	 * We still have privilege in this namespace so we can send
+	 * thread id instead of pid of main thread, uid, gid as 0
+	 * since these 2 are ignored in cgroupd
+	 */
+	ucred->pid = sys_gettid();
+	ucred->uid = 0;
+	ucred->gid = 0;
+
+	ret = sys_sendmsg(sk, &h, 0);
+	if (ret < 0) {
+		pr_err("Unable to send packet to cgroupd %d\n", ret);
+		return -1;
+	}
+
+	return 0;
+}
+
+/*
+ * As this socket is shared among threads, recvmsg(MSG_PEEK)
+ * from the socket until getting its own thread id as an
+ * acknowledge of successful threaded cgroup fixup
+ */
+static int recv_cg_set_restore_ack(int sk)
+{
+	struct cmsghdr *ch;
+	struct msghdr h = {};
+	char cmsg[CMSG_SPACE(sizeof(struct ucred))];
+	struct ucred *cred;
+	int ret;
+
+	h.msg_control = cmsg;
+	h.msg_controllen = sizeof(cmsg);
+
+	while (1) {
+		ret = sys_recvmsg(sk, &h, MSG_PEEK);
+		if (ret < 0) {
+			pr_err("Unable to peek from cgroupd %d\n", ret);
+			return -1;
+		}
+
+		if (h.msg_controllen != sizeof(cmsg)) {
+			pr_err("The message from cgroupd is truncated\n");
+			return -1;
+		}
+
+		ch = CMSG_FIRSTHDR(&h);
+		cred = (struct ucred *)CMSG_DATA(ch);
+		if (cred->pid != sys_gettid())
+			continue;
+
+		/*
+		 * Actual remove message from recv queue of socket
+		 */
+		ret = sys_recvmsg(sk, &h, 0);
+		if (ret < 0) {
+			pr_err("Unable to receive from cgroupd %d\n", ret);
+			return -1;
+		}
+
+		break;
+	}
+	return 0;
 }
 
 /*
  * Threads restoration via sigreturn. Note it's locked
  * routine and calls for unlock at the end.
  */
-long __export_restore_thread(struct thread_restore_args *args)
+__visible long __export_restore_thread(struct thread_restore_args *args)
 {
 	struct rt_sigframe *rt_sigframe;
 	k_rtsigset_t to_block;
@@ -509,16 +758,23 @@ long __export_restore_thread(struct thread_restore_args *args)
 
 	rt_sigframe = (void *)&args->mz->rt_sigframe;
 
+	if (args->cg_set != -1) {
+		pr_info("Restore cg_set in thread cg_set: %d\n", args->cg_set);
+		if (send_cg_set(args->cgroupd_sk, args->cg_set))
+			goto core_restore_end;
+		if (recv_cg_set_restore_ack(args->cgroupd_sk))
+			goto core_restore_end;
+		sys_close(args->cgroupd_sk);
+	}
+
 	if (restore_thread_common(args))
 		goto core_restore_end;
 
-	ret = restore_creds(args->creds_args, args->ta->proc_fd);
-	if (ret)
+	ret = sys_prctl(PR_SET_NAME, (unsigned long)&args->comm, 0, 0, 0);
+	if (ret) {
+		pr_err("Unable to set a thread name: %d\n", ret);
 		goto core_restore_end;
-
-	ret = restore_dumpable_flag(&args->ta->mm);
-	if (ret)
-		goto core_restore_end;
+	}
 
 	pr_info("%ld: Restored\n", sys_gettid());
 
@@ -528,10 +784,19 @@ long __export_restore_thread(struct thread_restore_args *args)
 		goto core_restore_end;
 
 	restore_finish_stage(task_entries_local, CR_STATE_RESTORE_SIGCHLD);
-	restore_pdeath_sig(args);
 
-	if (args->ta->seccomp_mode != SECCOMP_MODE_DISABLED)
-		pr_info("Restoring seccomp mode %d for %ld\n", args->ta->seccomp_mode, sys_getpid());
+	/*
+	 * Make sure it's before creds, since it's privileged
+	 * operation bound to uid 0 in current user ns.
+	 */
+	if (restore_seccomp(args))
+		BUG();
+
+	ret = restore_creds(args->creds_args, args->ta->proc_fd, args->ta->lsm_type, args->ta->uid);
+	ret = ret || restore_dumpable_flag(&args->ta->mm);
+	ret = ret || restore_pdeath_sig(args);
+	if (ret)
+		BUG();
 
 	restore_finish_stage(task_entries_local, CR_STATE_RESTORE_CREDS);
 
@@ -561,8 +826,7 @@ static long restore_self_exe_late(struct task_restore_args *args)
 }
 
 #ifndef ARCH_HAS_SHMAT_HOOK
-unsigned long arch_shmat(int shmid, void *shmaddr,
-			int shmflg, unsigned long size)
+unsigned long arch_shmat(int shmid, void *shmaddr, int shmflg, unsigned long size)
 {
 	return sys_shmat(shmid, shmaddr, shmflg);
 }
@@ -570,8 +834,8 @@ unsigned long arch_shmat(int shmid, void *shmaddr,
 
 static unsigned long restore_mapping(VmaEntry *vma_entry)
 {
-	int prot	= vma_entry->prot;
-	int flags	= vma_entry->flags | MAP_FIXED;
+	int prot = vma_entry->prot;
+	int flags = vma_entry->flags | MAP_FIXED;
 	unsigned long addr;
 
 	if (vma_entry_is(vma_entry, VMA_AREA_SYSVIPC)) {
@@ -591,7 +855,7 @@ static unsigned long restore_mapping(VmaEntry *vma_entry)
 		} else
 			att_flags = SHM_RDONLY;
 
-		pr_info("Attach SYSV shmem %d at %"PRIx64"\n", (int)vma_entry->fd, vma_entry->start);
+		pr_info("Attach SYSV shmem %d at %" PRIx64 "\n", (int)vma_entry->fd, vma_entry->start);
 		return arch_shmat(vma_entry->fd, shmaddr, att_flags, shmsize);
 	}
 
@@ -609,26 +873,28 @@ static unsigned long restore_mapping(VmaEntry *vma_entry)
 		flags |= MAP_ANONYMOUS;
 
 	/* A mapping of file with MAP_SHARED is up to date */
-	if ((vma_entry->fd == -1 || !(vma_entry->flags & MAP_SHARED)) &&
-			!(vma_entry->status & VMA_NO_PROT_WRITE))
+	if ((vma_entry->fd == -1 || !(vma_entry->flags & MAP_SHARED)) && !(vma_entry->status & VMA_NO_PROT_WRITE))
 		prot |= PROT_WRITE;
 
-	pr_debug("\tmmap(%"PRIx64" -> %"PRIx64", %x %x %d)\n",
-			vma_entry->start, vma_entry->end,
-			prot, flags, (int)vma_entry->fd);
+	/* TODO: Drop MAP_LOCKED bit and restore it after reading memory.
+	 *
+	 * Code below tries to limit memory usage by running fallocate()
+	 * after each preadv() to avoid doubling memory usage (once in
+	 * image files, once in process). Unfortunately, MAP_LOCKED defeats
+	 * that mechanism as it causes the process to be charged for memory
+	 * immediately upon mmap, not later upon preadv().
+	 */
+	pr_debug("\tmmap(%" PRIx64 " -> %" PRIx64 ", %x %x %d)\n", vma_entry->start, vma_entry->end, prot, flags,
+		 (int)vma_entry->fd);
 	/*
 	 * Should map memory here. Note we map them as
 	 * writable since we're going to restore page
 	 * contents.
 	 */
-	addr = sys_mmap(decode_pointer(vma_entry->start),
-			vma_entry_len(vma_entry),
-			prot, flags,
-			vma_entry->fd,
+	addr = sys_mmap(decode_pointer(vma_entry->start), vma_entry_len(vma_entry), prot, flags, vma_entry->fd,
 			vma_entry->pgoff);
 
-	if ((vma_entry->fd != -1) &&
-			(vma_entry->status & VMA_CLOSE))
+	if ((vma_entry->fd != -1) && (vma_entry->status & VMA_CLOSE))
 		sys_close(vma_entry->fd);
 
 	return addr;
@@ -637,7 +903,7 @@ static unsigned long restore_mapping(VmaEntry *vma_entry)
 /*
  * This restores aio ring header, content, head and in-kernel position
  * of tail. To set tail, we write to /dev/null and use the fact this
- * operation is synchronious for the device. Also, we unmap temporary
+ * operation is synchronous for the device. Also, we unmap temporary
  * anonymous area, used to store content of ring buffer during restore
  * and mapped in premap_private_vma().
  */
@@ -660,10 +926,9 @@ static int restore_aio_ring(struct rst_aio_ring *raio)
 
 	new = (struct aio_ring *)ctx;
 	i = (raio->len - sizeof(struct aio_ring)) / sizeof(struct io_event);
-	if (tail >= ring->nr || head >= ring->nr || ring->nr != i ||
-	    new->nr != ring->nr) {
-		pr_err("wrong aio: tail=%x head=%x req=%x old_nr=%x new_nr=%x expect=%x\n",
-			tail, head, raio->nr_req, ring->nr, new->nr, i);
+	if (tail >= ring->nr || head >= ring->nr || ring->nr != i || new->nr != ring->nr) {
+		pr_err("wrong aio: tail=%x head=%x req=%x old_nr=%x new_nr=%x expect=%x\n", tail, head, raio->nr_req,
+		       ring->nr, new->nr, i);
 
 		return -1;
 	}
@@ -690,15 +955,14 @@ static int restore_aio_ring(struct rst_aio_ring *raio)
 		count = ring->nr + tail;
 	else
 		count = tail;
-	maxr = min_t(unsigned, count, ring->nr-1);
+	maxr = min_t(unsigned, count, ring->nr - 1);
 
 	/*
 	 * Since we only interested in moving the tail, the requests
 	 * may be any. We submit count identical requests.
 	 */
 	size = sizeof(struct iocb) + maxr * sizeof(struct iocb *);
-	iocb = (void *)sys_mmap(NULL, size, PROT_READ|PROT_WRITE,
-				MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+	iocb = (void *)sys_mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 	iocbp = (void *)iocb + sizeof(struct iocb);
 
 	if (IS_ERR(iocb)) {
@@ -723,7 +987,7 @@ static int restore_aio_ring(struct rst_aio_ring *raio)
 		}
 		i += ret;
 
-		 /*
+		/*
 		  * We may submit less than requested, because of too big
 		  * count OR behaviour of get_reqs_available(), which
 		  * takes available requests only if their number is
@@ -755,9 +1019,7 @@ populate:
 	 * Also, this unmaps temporary anonymous area on raio->addr.
 	 */
 
-	ctx = sys_mremap(ctx, raio->len, raio->len,
-				MREMAP_FIXED | MREMAP_MAYMOVE,
-				raio->addr);
+	ctx = sys_mremap(ctx, raio->len, raio->len, MREMAP_FIXED | MREMAP_MAYMOVE, raio->addr);
 	if (ctx != raio->addr) {
 		pr_err("Ring remap failed with %ld\n", ctx);
 		return -1;
@@ -805,7 +1067,7 @@ static int enable_uffd(int uffd, unsigned long addr, unsigned long len)
 
 	pr_info("lazy-pages: register: %lx, len %lx\n", addr, len);
 
-	rc = sys_ioctl(uffd, UFFDIO_REGISTER, (unsigned long) &uffdio_register);
+	rc = sys_ioctl(uffd, UFFDIO_REGISTER, (unsigned long)&uffdio_register);
 	if (rc != 0) {
 		pr_err("lazy-pages: register %lx failed: rc:%d, \n", addr, rc);
 		return -1;
@@ -819,7 +1081,6 @@ static int enable_uffd(int uffd, unsigned long addr, unsigned long len)
 
 	return 0;
 }
-
 
 static int vma_remap(VmaEntry *vma_entry, int uffd)
 {
@@ -854,7 +1115,7 @@ static int vma_remap(VmaEntry *vma_entry, int uffd)
 		 * |G|----tgt----|       |
 		 *
 		 * 3. remap src to any other place.
-		 *    G prevents src from being remaped on tgt again
+		 *    G prevents src from being remapped on tgt again
 		 * |       |-------------| -> |+++++src+++++|
 		 * |G|---tgt-----|                          |
 		 *
@@ -866,23 +1127,20 @@ static int vma_remap(VmaEntry *vma_entry, int uffd)
 		unsigned long addr;
 
 		/* Map guard page (step 2) */
-		tmp = sys_mmap((void *) guard, PAGE_SIZE, PROT_NONE,
-					MAP_PRIVATE | MAP_ANONYMOUS, 0, 0);
+		tmp = sys_mmap((void *)guard, PAGE_SIZE, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, 0, 0);
 		if (tmp != guard) {
 			pr_err("Unable to map a guard page %lx (%lx)\n", guard, tmp);
 			return -1;
 		}
 
 		/* Move src to non-overlapping place (step 3) */
-		addr = sys_mmap(NULL, len, PROT_NONE,
-					MAP_PRIVATE | MAP_ANONYMOUS, 0, 0);
-		if (addr == (unsigned long) MAP_FAILED) {
+		addr = sys_mmap(NULL, len, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, 0, 0);
+		if (IS_ERR((void *)addr)) {
 			pr_err("Unable to reserve memory (%lx)\n", addr);
 			return -1;
 		}
 
-		tmp = sys_mremap(src, len, len,
-					MREMAP_MAYMOVE | MREMAP_FIXED, addr);
+		tmp = sys_mremap(src, len, len, MREMAP_MAYMOVE | MREMAP_FIXED, addr);
 		if (tmp != addr) {
 			pr_err("Unable to remap %lx -> %lx (%lx)\n", src, addr, tmp);
 			return -1;
@@ -938,14 +1196,13 @@ static int timerfd_arm(struct task_restore_args *args)
 
 			t->val.it_value.tv_sec += (time_t)ts.tv_sec;
 
-			pr_debug("Ajust id %#x it_value(%llu, %llu) -> it_value(%llu, %llu)\n",
-				 t->id, (unsigned long long)ts.tv_sec,
-				 (unsigned long long)ts.tv_nsec,
+			pr_debug("Adjust id %x it_value(%llu, %llu) -> it_value(%llu, %llu)\n", t->id,
+				 (unsigned long long)ts.tv_sec, (unsigned long long)ts.tv_nsec,
 				 (unsigned long long)t->val.it_value.tv_sec,
 				 (unsigned long long)t->val.it_value.tv_nsec);
 		}
 
-		ret  = sys_timerfd_settime(t->fd, t->settime_flags, &t->val, NULL);
+		ret = sys_timerfd_settime(t->fd, t->settime_flags, &t->val, NULL);
 		if (t->ticks)
 			ret |= sys_ioctl(t->fd, TFD_IOC_SET_TICKS, (unsigned long)&t->ticks);
 		if (ret) {
@@ -959,33 +1216,39 @@ static int timerfd_arm(struct task_restore_args *args)
 static int create_posix_timers(struct task_restore_args *args)
 {
 	int ret, i;
-	kernel_timer_t next_id;
+	kernel_timer_t next_id = 0, timer_id;
 	struct sigevent sev;
 
 	for (i = 0; i < args->posix_timers_n; i++) {
 		sev.sigev_notify = args->posix_timers[i].spt.it_sigev_notify;
 		sev.sigev_signo = args->posix_timers[i].spt.si_signo;
+#ifdef __GLIBC__
+		sev._sigev_un._tid = args->posix_timers[i].spt.notify_thread_id;
+#else
+		sev.sigev_notify_thread_id = args->posix_timers[i].spt.notify_thread_id;
+#endif
 		sev.sigev_value.sival_ptr = args->posix_timers[i].spt.sival_ptr;
 
 		while (1) {
-			ret = sys_timer_create(args->posix_timers[i].spt.clock_id, &sev, &next_id);
+			ret = sys_timer_create(args->posix_timers[i].spt.clock_id, &sev, &timer_id);
 			if (ret < 0) {
 				pr_err("Can't create posix timer - %d\n", i);
 				return ret;
 			}
 
-			if (next_id == args->posix_timers[i].spt.it_id)
-				break;
-
-			ret = sys_timer_delete(next_id);
-			if (ret < 0) {
-				pr_err("Can't remove temporaty posix timer 0x%x\n", next_id);
-				return ret;
-			}
-
-			if ((long)next_id > args->posix_timers[i].spt.it_id) {
+			if (timer_id != next_id) {
 				pr_err("Can't create timers, kernel don't give them consequently\n");
 				return -1;
+			}
+			next_id++;
+
+			if (timer_id == args->posix_timers[i].spt.it_id)
+				break;
+
+			ret = sys_timer_delete(timer_id);
+			if (ret < 0) {
+				pr_err("Can't remove temporaty posix timer 0x%x\n", timer_id);
+				return ret;
 			}
 		}
 	}
@@ -1008,18 +1271,23 @@ static void restore_posix_timers(struct task_restore_args *args)
  * sys_munmap must not return here. The control process must
  * trap us on the exit from sys_munmap.
  */
-#ifdef CONFIG_VDSO
 unsigned long vdso_rt_size = 0;
-#else
-#define vdso_rt_size	(0)
-#endif
 
 void *bootstrap_start = NULL;
 unsigned int bootstrap_len = 0;
 
-void __export_unmap(void)
+__visible void __export_unmap(void)
 {
 	sys_munmap(bootstrap_start, bootstrap_len - vdso_rt_size);
+}
+
+static void unregister_libc_rseq(struct rst_rseq_param *rseq)
+{
+	if (!rseq->rseq_abi_pointer)
+		return;
+
+	/* can't fail if rseq is registered */
+	sys_rseq(decode_pointer(rseq->rseq_abi_pointer), rseq->rseq_abi_size, 1, rseq->signature);
 }
 
 /*
@@ -1038,9 +1306,8 @@ void __export_unmap(void)
  * [ 1st end -- 2nd start ]
  * [ 2nd start -- task_size ]
  */
-static int unmap_old_vmas(void *premmapped_addr, unsigned long premmapped_len,
-		      void *bootstrap_start, unsigned long bootstrap_len,
-		      unsigned long task_size)
+static int unmap_old_vmas(void *premmapped_addr, unsigned long premmapped_len, void *bootstrap_start,
+			  unsigned long bootstrap_len, unsigned long task_size)
 {
 	unsigned long s1, s2;
 	void *p1, *p2;
@@ -1072,8 +1339,7 @@ static int unmap_old_vmas(void *premmapped_addr, unsigned long premmapped_len,
 
 	ret = sys_munmap(p2 + s2, task_size - (unsigned long)(p2 + s2));
 	if (ret) {
-		pr_err("Unable to unmap (%p-%p): %d\n",
-				p2 + s2, (void *)task_size, ret);
+		pr_err("Unable to unmap (%p-%p): %d\n", p2 + s2, (void *)task_size, ret);
 		return -1;
 	}
 
@@ -1094,8 +1360,7 @@ static int wait_helpers(struct task_restore_args *task_args)
 			continue;
 		}
 		if (!WIFEXITED(status) || WEXITSTATUS(status)) {
-			pr_err("%d exited with non-zero code (%d,%d)\n", pid,
-				WEXITSTATUS(status), WTERMSIG(status));
+			pr_err("%d exited with non-zero code (%d,%d)\n", pid, WEXITSTATUS(status), WTERMSIG(status));
 			return -1;
 		}
 	}
@@ -1118,8 +1383,7 @@ static int wait_zombies(struct task_restore_args *task_args)
 			 * Let's wait when someone complete this stage
 			 * and try again.
 			 */
-			futex_wait_while_eq(&task_entries_local->nr_in_progress,
-								nr_in_progress);
+			futex_wait_while_eq(&task_entries_local->nr_in_progress, nr_in_progress);
 			i--;
 			continue;
 		}
@@ -1127,39 +1391,214 @@ static int wait_zombies(struct task_restore_args *task_args)
 			pr_err("Wait on %d zombie failed: %d\n", task_args->zombies[i], ret);
 			return -1;
 		}
-		pr_debug("%ld: Collect a zombie with pid %d\n",
-			sys_getpid(), task_args->zombies[i]);
+		pr_debug("%ld: Collect a zombie with pid %d\n", sys_getpid(), task_args->zombies[i]);
 	}
 
 	return 0;
 }
 
-static bool vdso_unmapped(struct task_restore_args *args)
+static bool can_restore_vdso(struct task_restore_args *args)
 {
+	struct vdso_maps *rt = &args->vdso_maps_rt;
+	bool had_vdso = false, had_vvar = false;
 	unsigned int i;
 
-	/* Don't park rt-vdso or rt-vvar if dumpee doesn't have them */
 	for (i = 0; i < args->vmas_n; i++) {
 		VmaEntry *vma = &args->vmas[i];
 
-		if (vma_entry_is(vma, VMA_AREA_VDSO) ||
-				vma_entry_is(vma, VMA_AREA_VVAR))
-			return false;
+		if (vma_entry_is(vma, VMA_AREA_VDSO))
+			had_vdso = true;
+		if (vma_entry_is(vma, VMA_AREA_VVAR))
+			had_vvar = true;
 	}
+
+	if (had_vdso && (rt->vdso_start == VDSO_BAD_ADDR)) {
+		pr_err("Task had vdso, restorer doesn't\n");
+		return false;
+	}
+
+	/*
+	 * There is a use-case for restoring vvar alone: valgrind (see #488).
+	 * On the other side, we expect that vvar is touched by application
+	 * only from vdso. So, we can put a stale page and proceed restore
+	 * if kernel doesn't provide vvar [but provides vdso, if needede.
+	 * Just warn aloud that we don't like it.
+	 */
+	if (had_vvar && (rt->vvar_start == VVAR_BAD_ADDR))
+		pr_warn("Can't restore vvar - continuing regardless\n");
 
 	return true;
 }
 
-static bool vdso_needs_parking(struct task_restore_args *args)
+static inline int restore_child_subreaper(int child_subreaper)
 {
-	/* Compatible vDSO will be mapped, not moved */
-	if (args->compatible_mode)
-		return false;
+	int ret;
 
-	if (args->can_map_vdso)
-		return false;
+	if (!child_subreaper)
+		return 0;
 
-	return !vdso_unmapped(args);
+	ret = sys_prctl(PR_SET_CHILD_SUBREAPER, child_subreaper, 0, 0, 0);
+	if (ret) {
+		pr_err("Unable to set PR_SET_CHILD_SUBREAPER(%d): %d\n", child_subreaper, ret);
+		return -1;
+	}
+
+	return 0;
+}
+
+static int map_vdso(struct task_restore_args *args, bool compatible)
+{
+	struct vdso_maps *rt = &args->vdso_maps_rt;
+	int err;
+
+	err = arch_map_vdso(args->vdso_rt_parked_at, compatible);
+	if (err < 0) {
+		pr_err("Failed to map vdso %d\n", err);
+		return err;
+	}
+
+	/* kernel may provide only vdso */
+	if (rt->sym.vvar_size == VVAR_BAD_SIZE) {
+		rt->vdso_start = args->vdso_rt_parked_at;
+		rt->vvar_start = VVAR_BAD_ADDR;
+		return 0;
+	}
+
+	if (rt->sym.vdso_before_vvar) {
+		rt->vdso_start = args->vdso_rt_parked_at;
+		rt->vvar_start = rt->vdso_start + rt->sym.vdso_size;
+	} else {
+		rt->vvar_start = args->vdso_rt_parked_at;
+		rt->vdso_start = rt->vvar_start + rt->sym.vvar_size;
+	}
+
+	return 0;
+}
+
+static int fd_poll(int inotify_fd)
+{
+	struct pollfd pfd = { inotify_fd, POLLIN, 0 };
+	struct timespec tmo = { 0, 0 };
+
+	return sys_ppoll(&pfd, 1, &tmo, NULL, sizeof(sigset_t));
+}
+
+/*
+ * Call preadv() but limit size of the read. Zero `max_to_read` skips the limit.
+ */
+static ssize_t preadv_limited(int fd, struct iovec *iovs, int nr, off_t offs, size_t max_to_read)
+{
+	size_t saved_last_iov_len = 0;
+	ssize_t ret;
+
+	if (max_to_read) {
+		for (int i = 0; i < nr; ++i) {
+			if (iovs[i].iov_len <= max_to_read) {
+				max_to_read -= iovs[i].iov_len;
+				continue;
+			}
+
+			if (!max_to_read) {
+				nr = i;
+				break;
+			}
+
+			saved_last_iov_len = iovs[i].iov_len;
+			iovs[i].iov_len = max_to_read;
+			nr = i + 1;
+			break;
+		}
+	}
+
+	ret = sys_preadv(fd, iovs, nr, offs);
+	if (saved_last_iov_len)
+		iovs[nr - 1].iov_len = saved_last_iov_len;
+
+	return ret;
+}
+
+/*
+ * In the worst case buf size should be:
+ *   sizeof(struct inotify_event) * 2 + PATH_MAX
+ * See round_event_name_len() in kernel.
+ */
+#define EVENT_BUFF_SIZE ((sizeof(struct inotify_event) * 2 + PATH_MAX))
+
+/*
+ * Read all available events from inotify queue
+ */
+static int cleanup_inotify_events(int inotify_fd)
+{
+	char buf[EVENT_BUFF_SIZE * 3];
+	int ret;
+
+	/* Limit buf to be lesser than half of restorer's stack */
+	BUILD_BUG_ON(ARRAY_SIZE(buf) >= RESTORE_STACK_SIZE / 2);
+
+	while (1) {
+		ret = fd_poll(inotify_fd);
+		if (ret < 0) {
+			pr_err("Failed to poll from inotify fd: %d\n", ret);
+			return -1;
+		} else if (ret == 0) {
+			break;
+		}
+
+		ret = sys_read(inotify_fd, buf, sizeof(buf));
+		if (ret < 0) {
+			pr_err("Failed to read inotify events\n");
+			return -1;
+		}
+	}
+
+	return 0;
+}
+
+/*
+ * When we restore inotifies we can open and close files we create a watch
+ * for. So we need to cleanup these auxiliary events which we've generated.
+ *
+ * note: For now we don't have a way to c/r events in queue but we need to
+ * at least leave the queue clean from events generated by our own.
+ */
+int cleanup_current_inotify_events(struct task_restore_args *task_args)
+{
+	int i;
+
+	for (i = 0; i < task_args->inotify_fds_n; i++) {
+		int inotify_fd = task_args->inotify_fds[i];
+
+		pr_debug("Cleaning inotify events from %d\n", inotify_fd);
+
+		if (cleanup_inotify_events(inotify_fd))
+			return -1;
+	}
+
+	return 0;
+}
+
+/*
+ * Restore membarrier() registrations.
+ */
+static int restore_membarrier_registrations(int mask)
+{
+	unsigned long bitmap[1] = { mask };
+	int i, err, ret = 0;
+
+	if (!mask)
+		return 0;
+
+	pr_info("Restoring membarrier() registrations %x\n", mask);
+
+	for_each_bit(i, bitmap) {
+		err = sys_membarrier(1 << i, 0, 0);
+		if (!err)
+			continue;
+		pr_err("Can't restore membarrier(1 << %d) registration: %d\n", i, err);
+		ret = -1;
+	}
+
+	return ret;
 }
 
 /*
@@ -1169,7 +1608,7 @@ static bool vdso_needs_parking(struct task_restore_args *args)
  * and jump execution to some predefined ip read from
  * core file.
  */
-long __export_restore_task(struct task_restore_args *args)
+__visible long __export_restore_task(struct task_restore_args *args)
 {
 	long ret = -1;
 	int i;
@@ -1182,13 +1621,12 @@ long __export_restore_task(struct task_restore_args *args)
 	k_rtsigset_t to_block;
 	pid_t my_pid = sys_getpid();
 	rt_sigaction_t act;
+	bool has_vdso_proxy;
 
 	bootstrap_start = args->bootstrap_start;
-	bootstrap_len	= args->bootstrap_len;
+	bootstrap_len = args->bootstrap_len;
 
-#ifdef CONFIG_VDSO
-	vdso_rt_size	= args->vdso_rt_size;
-#endif
+	vdso_rt_size = args->vdso_rt_size;
 
 	fi_strategy = args->fault_strategy;
 
@@ -1198,16 +1636,27 @@ long __export_restore_task(struct task_restore_args *args)
 	zombies = args->zombies;
 	n_zombies = args->zombies_n;
 	*args->breakpoint = rst_sigreturn;
+#ifdef ARCH_HAS_LONG_PAGES
+	__page_size = args->page_size;
+#endif
 
 	ksigfillset(&act.rt_sa_mask);
 	act.rt_sa_handler = sigchld_handler;
 	act.rt_sa_flags = SA_SIGINFO | SA_RESTORER | SA_RESTART;
 	act.rt_sa_restorer = cr_restore_rt;
-	sys_sigaction(SIGCHLD, &act, NULL, sizeof(k_rtsigset_t));
+	ret = sys_sigaction(SIGCHLD, &act, NULL, sizeof(k_rtsigset_t));
+	if (ret) {
+		pr_err("Failed to set SIGCHLD %ld\n", ret);
+		goto core_restore_end;
+	}
 
 	ksigemptyset(&to_block);
 	ksigaddset(&to_block, SIGCHLD);
 	ret = sys_sigprocmask(SIG_UNBLOCK, &to_block, NULL, sizeof(k_rtsigset_t));
+	if (ret) {
+		pr_err("Failed to unblock SIGCHLD %ld\n", ret);
+		goto core_restore_end;
+	}
 
 	std_log_set_fd(args->logfd);
 	std_log_set_loglevel(args->loglevel);
@@ -1219,23 +1668,43 @@ long __export_restore_task(struct task_restore_args *args)
 		pr_debug("lazy-pages: uffd %d\n", args->uffd);
 	}
 
-	if (vdso_needs_parking(args)) {
-		if (vdso_do_park(&args->vdso_maps_rt,
-				args->vdso_rt_parked_at, vdso_rt_size))
+	/*
+	 * Park vdso/vvar in a safe place if architecture doesn't support
+	 * mapping them with arch_prctl().
+	 * Always preserve/map rt-vdso pair if it's possible, regardless
+	 * it's presence in original task: vdso will be used for fast
+	 * gettimeofday() in restorer's log timings.
+	 */
+	if (!args->can_map_vdso && vdso_is_present(&args->vdso_maps_rt)) {
+		/* It's already checked in kdat, but let's check again */
+		if (args->compatible_mode) {
+			pr_err("Compatible mode without vdso map support\n");
+			goto core_restore_end;
+		}
+		if (!can_restore_vdso(args))
+			goto core_restore_end;
+		if (vdso_do_park(&args->vdso_maps_rt, args->vdso_rt_parked_at, vdso_rt_size))
 			goto core_restore_end;
 	}
 
-	if (unmap_old_vmas((void *)args->premmapped_addr, args->premmapped_len,
-				bootstrap_start, bootstrap_len, args->task_size))
+	/*
+	 * We may have rseq registered already if CRIU compiled against
+	 * a fresh Glibc with rseq support. Anyway, we need to unregister it
+	 * before doing unmap_old_vmas or we will get SIGSEGV from the kernel,
+	 * for instance once the kernel will want to update (struct rseq).cpu_id field:
+	 * https://github.com/torvalds/linux/blob/ce522ba9ef7e/kernel/rseq.c#L89
+	 */
+	unregister_libc_rseq(&args->libc_rseq);
+
+	if (unmap_old_vmas((void *)args->premmapped_addr, args->premmapped_len, bootstrap_start, bootstrap_len,
+			   args->task_size))
 		goto core_restore_end;
 
 	/* Map vdso that wasn't parked */
-	if (!vdso_unmapped(args) && args->can_map_vdso) {
-		if (arch_map_vdso(args->vdso_rt_parked_at,
-				args->compatible_mode) < 0) {
-			goto core_restore_end;
-		}
-	}
+	if (args->can_map_vdso && (map_vdso(args, args->compatible_mode) < 0))
+		goto core_restore_end;
+
+	vdso_update_gtod_addr(&args->vdso_maps_rt);
 
 	/* Shift private vma-s to the left */
 	for (i = 0; i < args->vmas_n; i++) {
@@ -1271,15 +1740,13 @@ long __export_restore_task(struct task_restore_args *args)
 			goto core_restore_end;
 	}
 
-	if (args->uffd > -1) {
-		/* re-enable THP if we disabled it previously */
-		if (args->has_thp_enabled) {
-			if (sys_prctl(PR_SET_THP_DISABLE, 0, 0, 0, 0)) {
-				pr_err("Cannot re-enable THP\n");
-				goto core_restore_end;
-			}
-		}
+	ret = sys_prctl(PR_SET_THP_DISABLE, args->thp_disabled, 0, 0, 0);
+	if (ret) {
+		pr_err("Cannot restore THP_DISABLE=%d flag: %ld\n", args->thp_disabled, ret);
+		goto core_restore_end;
+	}
 
+	if (args->uffd > -1) {
 		pr_debug("lazy-pages: closing uffd %d\n", args->uffd);
 		/*
 		 * All userfaultfd configuration has finished at this point.
@@ -1295,8 +1762,7 @@ long __export_restore_task(struct task_restore_args *args)
 	for (i = 0; i < args->vmas_n; i++) {
 		vma_entry = args->vmas + i;
 
-		if (!vma_entry_is(vma_entry, VMA_AREA_REGULAR) &&
-				!vma_entry_is(vma_entry, VMA_AREA_AIORING))
+		if (!vma_entry_is(vma_entry, VMA_AREA_REGULAR) && !vma_entry_is(vma_entry, VMA_AREA_AIORING))
 			continue;
 
 		if (vma_entry_is(vma_entry, VMA_PREMMAPED))
@@ -1305,7 +1771,7 @@ long __export_restore_task(struct task_restore_args *args)
 		va = restore_mapping(vma_entry);
 
 		if (va != vma_entry->start) {
-			pr_err("Can't restore %"PRIx64" mapping with %lx\n", vma_entry->start, va);
+			pr_err("Can't restore %" PRIx64 " mapping with %lx\n", vma_entry->start, va);
 			goto core_restore_end;
 		}
 	}
@@ -1321,16 +1787,28 @@ long __export_restore_task(struct task_restore_args *args)
 		ssize_t r;
 
 		while (nr) {
-			pr_debug("Preadv %lx:%d... (%d iovs)\n",
-					(unsigned long)iovs->iov_base,
-					(int)iovs->iov_len, nr);
-			r = sys_preadv(args->vma_ios_fd, iovs, nr, rio->off);
+			pr_debug("Preadv %lx:%d... (%d iovs)\n", (unsigned long)iovs->iov_base, (int)iovs->iov_len, nr);
+			/*
+			 * If we're requested to punch holes in the file after reading we do
+			 * it to save memory. Limit the reads then to an arbitrary block size.
+			 */
+			r = preadv_limited(args->vma_ios_fd, iovs, nr, rio->off,
+					   args->auto_dedup ? AUTO_DEDUP_OVERHEAD_BYTES : 0);
 			if (r < 0) {
 				pr_err("Can't read pages data (%d)\n", (int)r);
 				goto core_restore_end;
 			}
 
 			pr_debug("`- returned %ld\n", (long)r);
+			/* If the file is open for writing, then it means we should punch holes
+			 * in it. */
+			if (r > 0 && args->auto_dedup) {
+				int fr = sys_fallocate(args->vma_ios_fd, FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE,
+						       rio->off, r);
+				if (fr < 0) {
+					pr_debug("Failed to punch holes with fallocate: %d\n", fr);
+				}
+			}
 			rio->off += r;
 			/* Advance the iovecs */
 			do {
@@ -1351,17 +1829,19 @@ long __export_restore_task(struct task_restore_args *args)
 		rio = ((void *)rio) + RIO_SIZE(rio->nr_iovs);
 	}
 
-	sys_close(args->vma_ios_fd);
+	if (args->vma_ios_fd != -1)
+		sys_close(args->vma_ios_fd);
 
-#ifdef CONFIG_VDSO
 	/*
 	 * Proxify vDSO.
 	 */
-	if (vdso_proxify(&args->vdso_maps_rt.sym, args->vdso_rt_parked_at,
-		     args->vmas, args->vmas_n, args->compatible_mode,
-		     fault_injected(FI_VDSO_TRAMPOLINES)))
+	if (vdso_proxify(&args->vdso_maps_rt, &has_vdso_proxy, args->vmas, args->vmas_n, args->compatible_mode,
+			 fault_injected(FI_VDSO_TRAMPOLINES)))
 		goto core_restore_end;
-#endif
+
+	/* unmap rt-vdso with restorer blob after restore's finished */
+	if (!has_vdso_proxy)
+		vdso_rt_size = 0;
 
 	/*
 	 * Walk though all VMAs again to drop PROT_WRITE
@@ -1373,13 +1853,10 @@ long __export_restore_task(struct task_restore_args *args)
 		if (!(vma_entry_is(vma_entry, VMA_AREA_REGULAR)))
 			continue;
 
-		if ((vma_entry->prot & PROT_WRITE) ||
-				(vma_entry->status & VMA_NO_PROT_WRITE))
+		if ((vma_entry->prot & PROT_WRITE) || (vma_entry->status & VMA_NO_PROT_WRITE))
 			continue;
 
-		sys_mprotect(decode_pointer(vma_entry->start),
-			     vma_entry_len(vma_entry),
-			     vma_entry->prot);
+		sys_mprotect(decode_pointer(vma_entry->start), vma_entry_len(vma_entry), vma_entry->prot);
 	}
 
 	/*
@@ -1403,22 +1880,16 @@ long __export_restore_task(struct task_restore_args *args)
 
 		for (m = 0; m < sizeof(vma_entry->madv) * 8; m++) {
 			if (vma_entry->madv & (1ul << m)) {
-				ret = sys_madvise(vma_entry->start,
-						  vma_entry_len(vma_entry),
-						  m);
+				ret = sys_madvise(vma_entry->start, vma_entry_len(vma_entry), m);
 				if (ret) {
-					pr_err("madvise(%"PRIx64", %"PRIu64", %ld) "
+					pr_err("madvise(%" PRIx64 ", %" PRIu64 ", %ld) "
 					       "failed with %ld\n",
-						vma_entry->start,
-						vma_entry_len(vma_entry),
-						m, ret);
+					       vma_entry->start, vma_entry_len(vma_entry), m, ret);
 					goto core_restore_end;
 				}
 			}
 		}
 	}
-
-	ret = 0;
 
 	/*
 	 * Tune up the task fields.
@@ -1430,38 +1901,56 @@ long __export_restore_task(struct task_restore_args *args)
 	/*
 	 * New kernel interface with @PR_SET_MM_MAP will become
 	 * more widespread once kernel get deployed over the world.
-	 * Thus lets be opportunistic and use new inteface as a try.
+	 * Thus lets be opportunistic and use new interface as a try.
 	 */
-	prctl_map = (struct prctl_mm_map) {
-		.start_code	= args->mm.mm_start_code,
-		.end_code	= args->mm.mm_end_code,
-		.start_data	= args->mm.mm_start_data,
-		.end_data	= args->mm.mm_end_data,
-		.start_stack	= args->mm.mm_start_stack,
-		.start_brk	= args->mm.mm_start_brk,
-		.brk		= args->mm.mm_brk,
-		.arg_start	= args->mm.mm_arg_start,
-		.arg_end	= args->mm.mm_arg_end,
-		.env_start	= args->mm.mm_env_start,
-		.env_end	= args->mm.mm_env_end,
-		.auxv		= (void *)args->mm_saved_auxv,
-		.auxv_size	= args->mm_saved_auxv_size,
-		.exe_fd		= args->fd_exe_link,
+	prctl_map = (struct prctl_mm_map){
+		.start_code = args->mm.mm_start_code,
+		.end_code = args->mm.mm_end_code,
+		.start_data = args->mm.mm_start_data,
+		.end_data = args->mm.mm_end_data,
+		.start_stack = args->mm.mm_start_stack,
+		.start_brk = args->mm.mm_start_brk,
+		.brk = args->mm.mm_brk,
+		.arg_start = args->mm.mm_arg_start,
+		.arg_end = args->mm.mm_arg_end,
+		.env_start = args->mm.mm_env_start,
+		.env_end = args->mm.mm_env_end,
+		.auxv = (void *)args->mm_saved_auxv,
+		.auxv_size = args->mm_saved_auxv_size,
+		.exe_fd = args->fd_exe_link,
 	};
 	ret = sys_prctl(PR_SET_MM, PR_SET_MM_MAP, (long)&prctl_map, sizeof(prctl_map), 0);
+	if (ret) {
+		pr_debug("prctl PR_SET_MM_MAP failed with %d\n", (int)ret);
+		pr_debug("  .start_code = %" PRIx64 "\n", prctl_map.start_code);
+		pr_debug("  .end_code = %" PRIx64 "\n", prctl_map.end_code);
+		pr_debug("  .start_data = %" PRIx64 "\n", prctl_map.start_data);
+		pr_debug("  .end_data = %" PRIx64 "\n", prctl_map.end_data);
+		pr_debug("  .start_stack = %" PRIx64 "\n", prctl_map.start_stack);
+		pr_debug("  .start_brk = %" PRIx64 "\n", prctl_map.start_brk);
+		pr_debug("  .brk = %" PRIx64 "\n", prctl_map.brk);
+		pr_debug("  .arg_start = %" PRIx64 "\n", prctl_map.arg_start);
+		pr_debug("  .arg_end = %" PRIx64 "\n", prctl_map.arg_end);
+		pr_debug("  .env_start = %" PRIx64 "\n", prctl_map.env_start);
+		pr_debug("  .env_end = %" PRIx64 "\n", prctl_map.env_end);
+		pr_debug("  .auxv_size = %" PRIu32 "\n", prctl_map.auxv_size);
+		for (i = 0; i < prctl_map.auxv_size / sizeof(uint64_t); i++)
+			pr_debug("  .auxv[%d] = %" PRIx64 "\n", i, prctl_map.auxv[i]);
+		pr_debug("  .exe_fd = %" PRIu32 "\n", prctl_map.exe_fd);
+	}
 	if (ret == -EINVAL) {
-		ret  = sys_prctl_safe(PR_SET_MM, PR_SET_MM_START_CODE,	(long)args->mm.mm_start_code, 0);
-		ret |= sys_prctl_safe(PR_SET_MM, PR_SET_MM_END_CODE,	(long)args->mm.mm_end_code, 0);
-		ret |= sys_prctl_safe(PR_SET_MM, PR_SET_MM_START_DATA,	(long)args->mm.mm_start_data, 0);
-		ret |= sys_prctl_safe(PR_SET_MM, PR_SET_MM_END_DATA,	(long)args->mm.mm_end_data, 0);
-		ret |= sys_prctl_safe(PR_SET_MM, PR_SET_MM_START_STACK,	(long)args->mm.mm_start_stack, 0);
-		ret |= sys_prctl_safe(PR_SET_MM, PR_SET_MM_START_BRK,	(long)args->mm.mm_start_brk, 0);
-		ret |= sys_prctl_safe(PR_SET_MM, PR_SET_MM_BRK,		(long)args->mm.mm_brk, 0);
-		ret |= sys_prctl_safe(PR_SET_MM, PR_SET_MM_ARG_START,	(long)args->mm.mm_arg_start, 0);
-		ret |= sys_prctl_safe(PR_SET_MM, PR_SET_MM_ARG_END,	(long)args->mm.mm_arg_end, 0);
-		ret |= sys_prctl_safe(PR_SET_MM, PR_SET_MM_ENV_START,	(long)args->mm.mm_env_start, 0);
-		ret |= sys_prctl_safe(PR_SET_MM, PR_SET_MM_ENV_END,	(long)args->mm.mm_env_end, 0);
-		ret |= sys_prctl_safe(PR_SET_MM, PR_SET_MM_AUXV,	(long)args->mm_saved_auxv, args->mm_saved_auxv_size);
+		ret = sys_prctl_safe(PR_SET_MM, PR_SET_MM_START_CODE, (long)args->mm.mm_start_code, 0);
+		ret |= sys_prctl_safe(PR_SET_MM, PR_SET_MM_END_CODE, (long)args->mm.mm_end_code, 0);
+		ret |= sys_prctl_safe(PR_SET_MM, PR_SET_MM_START_DATA, (long)args->mm.mm_start_data, 0);
+		ret |= sys_prctl_safe(PR_SET_MM, PR_SET_MM_END_DATA, (long)args->mm.mm_end_data, 0);
+		ret |= sys_prctl_safe(PR_SET_MM, PR_SET_MM_START_STACK, (long)args->mm.mm_start_stack, 0);
+		ret |= sys_prctl_safe(PR_SET_MM, PR_SET_MM_START_BRK, (long)args->mm.mm_start_brk, 0);
+		ret |= sys_prctl_safe(PR_SET_MM, PR_SET_MM_BRK, (long)args->mm.mm_brk, 0);
+		ret |= sys_prctl_safe(PR_SET_MM, PR_SET_MM_ARG_START, (long)args->mm.mm_arg_start, 0);
+		ret |= sys_prctl_safe(PR_SET_MM, PR_SET_MM_ARG_END, (long)args->mm.mm_arg_end, 0);
+		ret |= sys_prctl_safe(PR_SET_MM, PR_SET_MM_ENV_START, (long)args->mm.mm_env_start, 0);
+		ret |= sys_prctl_safe(PR_SET_MM, PR_SET_MM_ENV_END, (long)args->mm.mm_env_end, 0);
+		ret |= sys_prctl_safe(PR_SET_MM, PR_SET_MM_AUXV, (long)args->mm_saved_auxv, args->mm_saved_auxv_size);
 
 		/*
 		 * Because of requirements applied from kernel side
@@ -1478,6 +1967,13 @@ long __export_restore_task(struct task_restore_args *args)
 
 	if (ret)
 		goto core_restore_end;
+
+	/* SELinux (1) process context needs to be set before creating threads. */
+	if (args->lsm_type == LSMTYPE__SELINUX) {
+		/* Only for SELinux */
+		if (lsm_set_label(args->t->creds_args->lsm_profile, "current", args->proc_fd) < 0)
+			goto core_restore_end;
+	}
 
 	/*
 	 * We need to prepare a valid sigframe here, so
@@ -1510,24 +2006,21 @@ long __export_restore_task(struct task_restore_args *args)
 
 	if (args->nr_threads > 1) {
 		struct thread_restore_args *thread_args = args->thread_args;
-		long clone_flags = CLONE_VM | CLONE_FILES | CLONE_SIGHAND	|
-				   CLONE_THREAD | CLONE_SYSVSEM | CLONE_FS;
+		long clone_flags = CLONE_VM | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD | CLONE_SYSVSEM | CLONE_FS;
 		long last_pid_len;
+		pid_t thread_pid;
 		long parent_tid;
-		int i, fd;
+		int i, fd = -1;
 
-		fd = sys_openat(args->proc_fd, LAST_PID_PATH, O_RDWR, 0);
-		if (fd < 0) {
-			pr_err("can't open last pid fd %d\n", fd);
-			goto core_restore_end;
+		if (!args->has_clone3_set_tid) {
+			/* One level pid ns hierarhy */
+			fd = sys_openat(args->proc_fd, LAST_PID_PATH, O_RDWR, 0);
+			if (fd < 0) {
+				pr_err("can't open last pid fd %d\n", fd);
+				goto core_restore_end;
+			}
 		}
-
-		ret = sys_flock(fd, LOCK_EX);
-		if (ret) {
-			pr_err("Can't lock last_pid %d\n", fd);
-			sys_close(fd);
-			goto core_restore_end;
-		}
+		mutex_lock(&task_entries_local->last_pid_mutex);
 
 		for (i = 0; i < args->nr_threads; i++) {
 			char last_pid_buf[16], *s;
@@ -1537,37 +2030,52 @@ long __export_restore_task(struct task_restore_args *args)
 				continue;
 
 			new_sp = restorer_stack(thread_args[i].mz);
-			last_pid_len = std_vprint_num(last_pid_buf, sizeof(last_pid_buf), thread_args[i].pid - 1, &s);
-			sys_lseek(fd, 0, SEEK_SET);
-			ret = sys_write(fd, s, last_pid_len);
-			if (ret < 0) {
-				pr_err("Can't set last_pid %ld/%s\n", ret, last_pid_buf);
-				sys_close(fd);
-				goto core_restore_end;
+			if (args->has_clone3_set_tid) {
+				struct _clone_args c_args = {};
+				thread_pid = thread_args[i].pid;
+				c_args.set_tid = ptr_to_u64(&thread_pid);
+				c_args.flags = clone_flags;
+				c_args.set_tid_size = 1;
+				/* The kernel does stack + stack_size. */
+				c_args.stack = new_sp - RESTORE_STACK_SIZE;
+				c_args.stack_size = RESTORE_STACK_SIZE;
+				c_args.child_tid = ptr_to_u64(&thread_args[i].pid);
+				c_args.parent_tid = ptr_to_u64(&parent_tid);
+				pr_debug("Using clone3 to restore the process\n");
+				RUN_CLONE3_RESTORE_FN(ret, c_args, sizeof(c_args), &thread_args[i],
+						      args->clone_restore_fn);
+			} else {
+				last_pid_len =
+					std_vprint_num(last_pid_buf, sizeof(last_pid_buf), thread_args[i].pid - 1, &s);
+				sys_lseek(fd, 0, SEEK_SET);
+				ret = sys_write(fd, s, last_pid_len);
+				if (ret < 0) {
+					pr_err("Can't set last_pid %ld/%s\n", ret, s);
+					sys_close(fd);
+					mutex_unlock(&task_entries_local->last_pid_mutex);
+					goto core_restore_end;
+				}
+
+				/*
+				 * To achieve functionality like libc's clone()
+				 * we need a pure assembly here, because clone()'ed
+				 * thread will run with own stack and we must not
+				 * have any additional instructions... oh, dear...
+				 */
+				RUN_CLONE_RESTORE_FN(ret, clone_flags, new_sp, parent_tid, thread_args,
+						     args->clone_restore_fn);
 			}
-
-			/*
-			 * To achieve functionality like libc's clone()
-			 * we need a pure assembly here, because clone()'ed
-			 * thread will run with own stack and we must not
-			 * have any additional instructions... oh, dear...
-			 */
-
-			RUN_CLONE_RESTORE_FN(ret, clone_flags, new_sp, parent_tid, thread_args, args->clone_restore_fn);
 			if (ret != thread_args[i].pid) {
 				pr_err("Unable to create a thread: %ld\n", ret);
+				sys_close(fd);
+				mutex_unlock(&task_entries_local->last_pid_mutex);
 				goto core_restore_end;
 			}
 		}
 
-		ret = sys_flock(fd, LOCK_UN);
-		if (ret) {
-			pr_err("Can't unlock last_pid %ld\n", ret);
+		mutex_unlock(&task_entries_local->last_pid_mutex);
+		if (fd >= 0)
 			sys_close(fd);
-			goto core_restore_end;
-		}
-
-		sys_close(fd);
 	}
 
 	restore_rlims(args);
@@ -1583,6 +2091,9 @@ long __export_restore_task(struct task_restore_args *args)
 		pr_err("Can't restore timerfd %ld\n", ret);
 		goto core_restore_end;
 	}
+
+	if (restore_membarrier_registrations(args->membarrier_registration_mask) < 0)
+		goto core_restore_end;
 
 	pr_info("%ld: Restored\n", sys_getpid());
 
@@ -1600,9 +2111,11 @@ long __export_restore_task(struct task_restore_args *args)
 		goto core_restore_end;
 	}
 
+	if (cleanup_current_inotify_events(args))
+		goto core_restore_end;
+
 	if (!args->compatible_mode) {
-		sys_sigaction(SIGCHLD, &args->sigchld_act,
-				NULL, sizeof(k_rtsigset_t));
+		ret = sys_sigaction(SIGCHLD, &args->sigchld_act, NULL, sizeof(k_rtsigset_t));
 	} else {
 		void *stack = alloc_compat_syscall_stack();
 
@@ -1610,9 +2123,12 @@ long __export_restore_task(struct task_restore_args *args)
 			pr_err("Failed to allocate 32-bit stack for sigaction\n");
 			goto core_restore_end;
 		}
-		arch_compat_rt_sigaction(stack, SIGCHLD,
-				(void*)&args->sigchld_act);
+		ret = arch_compat_rt_sigaction(stack, SIGCHLD, (void *)&args->sigchld_act);
 		free_compat_syscall_stack(stack);
+	}
+	if (ret) {
+		pr_err("Failed to restore SIGCHLD: %ld\n", ret);
+		goto core_restore_end;
 	}
 
 	ret = restore_signals(args->siginfo, args->siginfo_n, true);
@@ -1627,11 +2143,11 @@ long __export_restore_task(struct task_restore_args *args)
 
 	rst_tcp_socks_all(args);
 
-	/* The kernel restricts setting seccomp to uid 0 in the current user
-	 * ns, so we must do this before restore_creds.
+	/*
+	 * Make sure it's before creds, since it's privileged
+	 * operation bound to uid 0 in current user ns.
 	 */
-	pr_info("restoring seccomp mode %d for %ld\n", args->seccomp_mode, sys_getpid());
-	if (restore_seccomp(args))
+	if (restore_seccomp(args->t))
 		goto core_restore_end;
 
 	/*
@@ -1639,9 +2155,10 @@ long __export_restore_task(struct task_restore_args *args)
 	 * turning off TCP repair is CAP_SYS_NED_ADMIN protected,
 	 * thus restore* creds _after_ all of the above.
 	 */
-	ret = restore_creds(args->t->creds_args, args->proc_fd);
+	ret = restore_creds(args->t->creds_args, args->proc_fd, args->lsm_type, args->uid);
 	ret = ret || restore_dumpable_flag(&args->mm);
 	ret = ret || restore_pdeath_sig(args->t);
+	ret = ret || restore_child_subreaper(args->child_subreaper);
 
 	futex_set_and_wake(&thread_inprogress, args->nr_threads);
 
@@ -1657,13 +2174,11 @@ long __export_restore_task(struct task_restore_args *args)
 	std_log_set_fd(-1);
 
 	/*
-	 * The code that prepared the itimers makes shure the
+	 * The code that prepared the itimers makes sure that the
 	 * code below doesn't fail due to bad timing values.
 	 */
 
-#define itimer_armed(args, i)				\
-		(args->itimers[i].it_interval.tv_sec ||	\
-		 args->itimers[i].it_interval.tv_usec)
+#define itimer_armed(args, i) (args->itimers[i].it_interval.tv_sec || args->itimers[i].it_interval.tv_usec)
 
 	if (itimer_armed(args, 0))
 		sys_setitimer(ITIMER_REAL, &args->itimers[0], NULL);

@@ -40,7 +40,7 @@ void test_msg(const char *format, ...)
 	va_list arg;
 	int off = 0;
 	char buf[TEST_MSG_BUFFER_SIZE];
-	int __errno = errno;
+	int _errno = errno;
 	struct timeval tv;
 	struct tm *tm;
 
@@ -50,8 +50,7 @@ void test_msg(const char *format, ...)
 	gettimeofday(&tv, NULL);
 	tm = localtime(&tv.tv_sec);
 	if (tm == NULL) {
-		fprintf(stderr, "ERROR in %s: localtime() failed: %m\n",
-				__func__);
+		fprintf(stderr, "ERROR in %s: localtime() failed: %m\n", __func__);
 	} else {
 		off += strftime(buf, sizeof(buf), "%H:%M:%S", tm);
 	}
@@ -64,6 +63,6 @@ skip:
 	off += vsnprintf(buf + off, sizeof(buf) - off, format, arg);
 	va_end(arg);
 
-	fprintf(stderr, "%s", buf);
-	errno = __errno;
+	write(2, buf, off);
+	errno = _errno;
 }
