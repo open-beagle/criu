@@ -7,68 +7,37 @@ git remote add upstream git@github.com:checkpoint-restore/criu.git
 
 git fetch upstream
 
-git merge v3.9
+git merge v3.19
 ```
 
 ## build
 
 ```bash
-# golang build
+docker pull registry.cn-qingdao.aliyuncs.com/wod/debian:11 && \
 docker run -it --rm \
--v $PWD/:/go/src/github.com/checkpoint-restore/criu \
--w /go/src/github.com/checkpoint-restore/criu \
--e VERSION=v3.9-beagle \
-registry.cn-qingdao.aliyuncs.com/wod/golang:1.22 \
-bash .beagle/build.sh
+  -v $PWD/:/go/src/github.com/checkpoint-restore/criu \
+  -w /go/src/github.com/checkpoint-restore/criu \
+  -e BUILD_VERSION="3.19" \
+  -e BUILD_OS="debian11" \
+  -e BUILD_ARCH="amd64" \
+  registry.cn-qingdao.aliyuncs.com/wod/debian:11 \
+  bash .beagle/build11.sh
 
-sudo apt update && sudo apt-get install -y \
-    protobuf-c-compiler protobuf-compiler libprotobuf-dev libprotobuf-c-dev \
-    libnl-3-dev libnet-dev libcap-dev libaio-dev python3-protobuf \
-    libnftnl-dev iproute2 pkg-config build-essential libbsd-dev \
-    asciidoc xmlto libtool automake
-
-make
-
-make DESTDIR=.tmp/ install
+docker pull registry.cn-qingdao.aliyuncs.com/wod/debian:12 && \
+docker run -it --rm \
+  -v $PWD/:/go/src/github.com/checkpoint-restore/criu \
+  -w /go/src/github.com/checkpoint-restore/criu \
+  -e BUILD_VERSION="3.19" \
+  -e BUILD_OS="debian12" \
+  -e BUILD_ARCH="amd64" \
+  registry.cn-qingdao.aliyuncs.com/wod/debian:12 \
+  bash .beagle/build.sh
 ```
 
-## test
+## install
 
 ```bash
-file _output/linux-amd64/criu
-
-# amd64-test
-docker run -it --rm \
--v $PWD/:/go/src/github.com/checkpoint-restore/criu \
--w /go/src/github.com/checkpoint-restore/criu \
-registry.cn-qingdao.aliyuncs.com/wod/debian:bullseye-amd64 \
-./_output/linux-amd64/criu -v
-
-docker run -it --rm \
--v $PWD/:/go/src/github.com/checkpoint-restore/criu \
--w /go/src/github.com/checkpoint-restore/criu \
-registry.cn-qingdao.aliyuncs.com/wod/alpine:3-amd64 \
-./_output/linux-amd64/criu -v
-
-# arm64-test
-docker run -it --rm \
--v $PWD/:/go/src/github.com/checkpoint-restore/criu \
--w /go/src/github.com/checkpoint-restore/criu \
-registry.cn-qingdao.aliyuncs.com/wod/debian:bullseye-arm64 \
-./_output/linux-arm64/criu -v
-
-docker run -it --rm \
--v $PWD/:/go/src/github.com/checkpoint-restore/criu \
--w /go/src/github.com/checkpoint-restore/criu \
-registry.cn-qingdao.aliyuncs.com/wod/alpine:3-arm64 \
-./_output/linux-arm64/criu -v
-
-# loong64-test
-docker run -it --rm \
--v $PWD/:/go/src/github.com/checkpoint-restore/criu \
--w /go/src/github.com/checkpoint-restore/criu \
-registry.cn-qingdao.aliyuncs.com/wod/alpine:3-loong64 \
-./_output/linux-loong64/criu -v
+apt install -y ./criu-3.19-debian12-amd64.deb
 ```
 
 ## cache

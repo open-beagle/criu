@@ -12,9 +12,11 @@ apt update
 apt install -y \
   gcc bsdmainutils build-essential git iptables \
   libnet1-dev libnl-route-3-dev libaio-dev libcap-dev libnl-3-dev libprotobuf-c-dev libprotobuf-dev libselinux1-dev \
+  libbsd-dev libnftables-dev libdrm-dev libdrm-amdgpu1 libgnutls28-dev \
   pkg-config protobuf-c-compiler protobuf-compiler python3-minimal asciidoc
 
 rm -rf build/system
+make clean
 make -j $(nproc) DESTDIR=build/system/ install
 
 # 创建目录结构
