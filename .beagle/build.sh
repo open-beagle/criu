@@ -41,4 +41,5 @@ Description: CRIU - Checkpoint/Restore in Userspace
 EOF
 
 # 打包成 .deb 文件
-dpkg-deb --build $BUILD_ROOT/build/system $BUILD_ROOT/build/criu-${BUILD_VERSION}-${BUILD_OS}-${BUILD_ARCH}.deb
+mkdir -p $BUILD_ROOT/build/deb
+dpkg-deb --build $BUILD_ROOT/build/system $BUILD_ROOT/build/deb/criu-${BUILD_VERSION}-${BUILD_OS}-${BUILD_ARCH}.deb
