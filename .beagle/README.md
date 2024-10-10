@@ -17,7 +17,7 @@ docker pull registry.cn-qingdao.aliyuncs.com/wod/debian:11 && \
 docker run -it --rm \
   -v $PWD/:/go/src/github.com/checkpoint-restore/criu \
   -w /go/src/github.com/checkpoint-restore/criu \
-  -e BUILD_VERSION="3.19" \
+  -e BUILD_VERSION="4.0" \
   -e BUILD_OS="debian11" \
   -e BUILD_ARCH="amd64" \
   registry.cn-qingdao.aliyuncs.com/wod/debian:11 \
@@ -27,7 +27,7 @@ docker pull registry.cn-qingdao.aliyuncs.com/wod/debian:12 && \
 docker run -it --rm \
   -v $PWD/:/go/src/github.com/checkpoint-restore/criu \
   -w /go/src/github.com/checkpoint-restore/criu \
-  -e BUILD_VERSION="3.19" \
+  -e BUILD_VERSION="4.0" \
   -e BUILD_OS="debian12" \
   -e BUILD_ARCH="amd64" \
   registry.cn-qingdao.aliyuncs.com/wod/debian:12 \
@@ -39,9 +39,9 @@ ldd build/system/usr/local/sbin/criu
 ## install
 
 ```bash
-apt install -y /etc/kubernetes/downloads/criu-3.19-debian12-amd64.deb
+apt install -y /etc/kubernetes/downloads/criu-4.0-debian12-amd64.deb
 
-apt install -y /etc/kubernetes/downloads/criu-3.19-debian11-amd64.deb
+apt install -y /etc/kubernetes/downloads/criu-4.0-debian11-amd64.deb
 ```
 
 ## cache
