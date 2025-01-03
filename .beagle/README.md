@@ -7,7 +7,7 @@ git remote add upstream git@github.com:checkpoint-restore/criu.git
 
 git fetch upstream
 
-git merge v3.19
+git merge v4.0
 ```
 
 ## build
